@@ -87,7 +87,11 @@ run_decision_engine() {
         if [ "$HVF_AVAILABLE" -eq 1 ]; then
             DECISION_ACCEL="hvf"
         else
-            DECISION_ACCEL_WARN="HVF unavailable. Running with TCG software emulation."
+            if [[ "$HOST_ARCH" == "arm64" && "$TARGET_ARCH" == "x86_64" ]]; then
+                DECISION_ACCEL_WARN="Cross-architecture virtualization (x86_64 guest on Apple Silicon host) does not support HVF. Running with TCG software emulation."
+            else
+                DECISION_ACCEL_WARN="HVF unavailable. Running with TCG software emulation."
+            fi
         fi
     fi
 

@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  validate-scripts:
+    name: Validate Scripts & Config
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate Bash Script Syntax
+        run: |
+          echo "Checking syntax of shell scripts..."
+          find . -name "*.sh" -exec bash -n {} +
+          echo "All shell scripts passed bash -n syntax check."
+
+      - name: Validate JSON Configuration
+        run: |
+          python3 -m json.tool config.json > /dev/null
+          echo "config.json is valid JSON."
+
+  powershell-syntax:
+    name: Validate PowerShell Syntax
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Parse PowerShell Scripts
+        shell: pwsh
+        run: |
+          $errors = @()
+          Get-ChildItem -Path . -Filter "*.ps1" -Recurse | ForEach-Object {
+              $tokens = $null
+              $parseErrors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
+              if ($parseErrors.Count -gt 0) {
+                  Write-Error "Syntax errors in $($_.FullName):"
+                  $parseErrors | ForEach-Object { Write-Error $_ }
+                  $errors += $parseErrors
+              } else {
+                  Write-Host "Parsed successfully: $($_.FullName)" -ForegroundColor Green
+              }
+          }
+          if ($errors.Count -gt 0) { exit 1 }

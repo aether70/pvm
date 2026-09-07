@@ -8,17 +8,26 @@ build_qemu_command() {
     QEMU_ARGS+=("-name" "$DECISION_VM_NAME")
 
     # 2. Machine and Accelerator
+    local machine_type="q35"
+    if [ "$TARGET_ARCH" = "aarch64" ]; then
+        machine_type="virt"
+    fi
+
     if [ "$DECISION_ACCEL" = "tcg" ]; then
-        QEMU_ARGS+=("-machine" "q35,accel=tcg")
+        QEMU_ARGS+=("-machine" "${machine_type},accel=tcg")
     else
-        QEMU_ARGS+=("-machine" "q35,accel=$DECISION_ACCEL")
+        QEMU_ARGS+=("-machine" "${machine_type},accel=$DECISION_ACCEL")
     fi
 
     # 3. CPU model
     if [ "$DECISION_ACCEL" = "kvm" ] || [ "$DECISION_ACCEL" = "hvf" ]; then
         QEMU_ARGS+=("-cpu" "host")
     else
-        QEMU_ARGS+=("-cpu" "max")
+        if [ "$TARGET_ARCH" = "aarch64" ]; then
+            QEMU_ARGS+=("-cpu" "cortex-a72")
+        else
+            QEMU_ARGS+=("-cpu" "max")
+        fi
     fi
 
     # 4. SMP & Memory

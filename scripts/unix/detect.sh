@@ -58,22 +58,76 @@ detect_host_info() {
         fi
 
         VIRT_HW_SUPPORT=1
-        HVF_AVAILABLE=1
     fi
 
-    # 2. Locate QEMU Binary
-    if command -v qemu-system-x86_64 >/dev/null 2>&1; then
-        QEMU_PATH=$(command -v qemu-system-x86_64)
-    elif [ -x "$root_dir/backends/linux/qemu/qemu-system-x86_64" ]; then
-        QEMU_PATH="$root_dir/backends/linux/qemu/qemu-system-x86_64"
-    elif [ -x "/usr/local/bin/qemu-system-x86_64" ]; then
-        QEMU_PATH="/usr/local/bin/qemu-system-x86_64"
-    elif [ -x "/opt/homebrew/bin/qemu-system-x86_64" ]; then
-        QEMU_PATH="/opt/homebrew/bin/qemu-system-x86_64"
+    # 2. Resolve Target Architecture & Locate QEMU Binary
+    TARGET_ARCH="x86_64"
+    if [ -f "$root_dir/config.json" ]; then
+        local cfg_arch
+        cfg_arch=$(grep -o '"arch"[^:]*:[^"]*"[^"]*"' "$root_dir/config.json" 2>/dev/null | head -n1 | cut -d'"' -f4)
+        if [ -n "$cfg_arch" ]; then
+            TARGET_ARCH="$cfg_arch"
+        fi
+    fi
+
+    # If host is Apple Silicon / ARM64 and target is x86_64, check if native aarch64 binary exists
+    if [[ ("$HOST_ARCH" == "arm64" || "$HOST_ARCH" == "aarch64") && "$TARGET_ARCH" == "x86_64" ]]; then
+        if ! command -v qemu-system-x86_64 >/dev/null 2>&1 && command -v qemu-system-aarch64 >/dev/null 2>&1; then
+            TARGET_ARCH="aarch64"
+        fi
+    fi
+
+    local qemu_bin="qemu-system-$TARGET_ARCH"
+    local qemu_search_paths=(
+        "$root_dir/backends/linux/qemu/$qemu_bin"
+        "/opt/homebrew/bin/$qemu_bin"
+        "/usr/local/bin/$qemu_bin"
+        "/usr/bin/$qemu_bin"
+    )
+
+    if command -v "$qemu_bin" >/dev/null 2>&1; then
+        QEMU_PATH=$(command -v "$qemu_bin")
+    else
+        for p in "${qemu_search_paths[@]}"; do
+            if [ -x "$p" ]; then
+                QEMU_PATH="$p"
+                break
+            fi
+        done
+    fi
+
+    # Fallback to general qemu-system-x86_64 if TARGET_ARCH was not found
+    if [ -z "$QEMU_PATH" ] && [ "$TARGET_ARCH" != "x86_64" ]; then
+        if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+            QEMU_PATH=$(command -v qemu-system-x86_64)
+            TARGET_ARCH="x86_64"
+        fi
     fi
 
     if [ -n "$QEMU_PATH" ]; then
         QEMU_VERSION=$("$QEMU_PATH" --version 2>&1 | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "Unknown")
         QEMU_ACCELS=$("$QEMU_PATH" -accel help 2>&1 | tr '\n' ' ')
+    fi
+
+    # 3. Virtualization & Hypervisor support check on Darwin
+    if [ "$HOST_OS" = "Darwin" ]; then
+        # Apple HVF only accelerates guests with matching CPU ISA (arm64 guest on arm64 host, x86_64 on x86_64)
+        if [[ "$HOST_ARCH" == "arm64" && "$TARGET_ARCH" == "aarch64" ]]; then
+            HVF_AVAILABLE=1
+        elif [[ "$HOST_ARCH" == "x86_64" && "$TARGET_ARCH" == "x86_64" ]]; then
+            HVF_AVAILABLE=1
+        else
+            HVF_AVAILABLE=0
+        fi
+    fi
+
+    # 4. Storage / SSD Free Space (in GB)
+    HOST_SSD_FREE_GB=0
+    if [ -d "$root_dir" ]; then
+        local free_kb
+        free_kb=$(df -k "$root_dir" 2>/dev/null | awk 'NR==2 {print $4}')
+        if [ -n "$free_kb" ] && [ "$free_kb" -gt 0 ] 2>/dev/null; then
+            HOST_SSD_FREE_GB=$(( free_kb / 1048576 ))
+        fi
     fi
 }
