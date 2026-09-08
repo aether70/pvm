@@ -1,30 +1,67 @@
 {
-  "version": "0.1-beta",
+  "version": "0.2",
   "vm_defaults": {
     "memory_percent": 50,
     "memory_min_mb": 2048,
     "memory_max_mb": 16384,
+    "host_reserve_mb": 1536,
     "cores_percent": 50,
     "cores_min": 2,
     "cores_max": 8,
     "display": "sdl",
     "network": "nat",
     "ssh_port": 2222,
-    "uefi": false,
-    "arch": "x86_64"
+    "uefi": true,
+    "arch": "x86_64",
+    "disk_cache": "auto",
+    "gl": "auto",
+    "audio": "auto"
+  },
+  "guest_arch": {
+    "x86_64": {
+      "machine": "q35",
+      "cpu_native": "host",
+      "cpu_emulated": "max",
+      "vga_device": "virtio-vga",
+      "vga_device_gl": "virtio-vga-gl",
+      "vga_fallback": "std",
+      "uefi_required": false,
+      "firmware_code": "edk2-x86_64-code.fd,OVMF_CODE.fd,OVMF_CODE_4M.fd",
+      "firmware_vars": "edk2-i386-vars.fd,OVMF_VARS.fd,OVMF_VARS_4M.fd"
+    },
+    "aarch64": {
+      "machine": "virt",
+      "cpu_native": "host",
+      "cpu_emulated": "max",
+      "vga_device": "virtio-gpu-pci",
+      "vga_device_gl": "virtio-gpu-gl-pci",
+      "vga_fallback": "virtio-gpu-pci",
+      "uefi_required": true,
+      "firmware_code": "edk2-aarch64-code.fd,AAVMF_CODE.fd,QEMU_EFI.fd",
+      "firmware_vars": "edk2-arm-vars.fd,AAVMF_VARS.fd,QEMU_VARS.fd"
+    }
+  },
+  "host_accel": {
+    "Darwin": "hvf",
+    "Linux": "kvm",
+    "Windows": "whpx"
+  },
+  "host_audio": {
+    "Darwin": "coreaudio",
+    "Linux": "pa",
+    "Windows": "dsound"
   },
   "backends": {
     "windows": {
       "relative_qemu_path": "backends/windows/qemu",
-      "prefer_accel": "whpx",
       "fallback_accel": "tcg"
     },
     "linux": {
-      "prefer_accel": "kvm",
+      "relative_qemu_path": "backends/linux/qemu",
       "fallback_accel": "tcg"
     },
     "macos": {
-      "prefer_accel": "hvf",
+      "relative_qemu_path": "backends/macos/qemu",
       "fallback_accel": "tcg"
     }
   }

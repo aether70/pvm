@@ -24,6 +24,7 @@ $RootDir = Split-Path (Split-Path $ScriptDir -Parent) -Parent
 . (Join-Path $ScriptDir "decide.ps1")
 . (Join-Path $ScriptDir "build_command.ps1")
 . (Join-Path $ScriptDir "display.ps1")
+. (Join-Path $ScriptDir "lock.ps1")
 
 Show-Banner
 
@@ -67,19 +68,36 @@ if ($Setup) {
     }
     Write-Host " Done." -ForegroundColor Green
 
-    # Launch it immediately
-    $selectedVmSetup = [PSCustomObject]@{ Name = $vmNameSetup; FullPath = $res.VmDir; DiskSizeBytes = 0 }
-    $decisionSetup = Invoke-DecisionEngine -HostInfo $hostInfo -RootDir $RootDir -VmDir $res.VmDir
-    $decisionSetup | Add-Member -NotePropertyName IsoPath -NotePropertyValue $isoPath -Force
-    
+    # Boot the installer. Firmware mode is left exactly as it will be on every
+    # later boot: installing under BIOS and then booting under UEFI (or the
+    # reverse) leaves a disk the firmware cannot boot.
+    $decisionSetup = Invoke-DecisionEngine -HostInfo $hostInfo -RootDir $RootDir -VmDir $res.VmDir -IsoPath $isoPath
+    Show-DecisionSummary -Decision $decisionSetup -HostInfo $hostInfo
+
+    if (-not $decisionSetup.IsValid) {
+        Write-Host "  [X] Cannot start the installer:" -ForegroundColor Red
+        foreach ($err in $decisionSetup.Errors) {
+            Write-Host "      - $err" -ForegroundColor Red
+        }
+        exit 1
+    }
+
+    $lockSetup = Lock-PvmVm -VmDir $res.VmDir
+    if (-not $lockSetup.Acquired) {
+        Write-Host "  [!] VM '$vmNameSetup' is already running (locked by $($lockSetup.Owner))." -ForegroundColor Red
+        exit 1
+    }
+
     $cmdSpecSetup = Build-QemuCommand -Decision $decisionSetup
-    Write-Host "  [*] Launching Installer for '$vmNameSetup'..." -ForegroundColor Green
+    Write-Host "  [*] Launching installer for '$vmNameSetup'..." -ForegroundColor Green
     try {
-        $processSetup = Start-Process -FilePath $cmdSpecSetup.Executable -ArgumentList $cmdSpecSetup.Arguments -Wait -PassThru -NoNewWindow
+        $processSetup = Start-Process -FilePath $cmdSpecSetup.Executable -ArgumentList $cmdSpecSetup.ArgumentString -Wait -PassThru -NoNewWindow
         exit $processSetup.ExitCode
     } catch {
         Write-Host "  [X] Failed to launch QEMU: $_" -ForegroundColor Red
         exit 1
+    } finally {
+        Unlock-PvmVm -VmDir $res.VmDir
     }
 }
 
@@ -98,33 +116,45 @@ if ($Delete) {
         exit 1
     }
 
+    # Deleting the backing image out from under a live QEMU is the one
+    # destructive race the instance lock exists to prevent, so this path takes
+    # the lock too rather than only checking for it.
+    $lockDel = Lock-PvmVm -VmDir $targetDir
+    if (-not $lockDel.Acquired) {
+        Write-Host "  [!] VM '$VmName' appears to be running (locked by $($lockDel.Owner)). Shut it down first." -ForegroundColor Red
+        exit 1
+    }
+
     Write-Host "`n  [-] DELETE VM" -ForegroundColor Red
-    Write-Host "  WARNING: You are about to permanently delete the VM '$VmName'." -ForegroundColor Yellow
-    Write-Host "  All data will be lost. This action cannot be undone." -ForegroundColor Yellow
-    
+    Write-Host "  This permanently deletes '$VmName' and every file in it." -ForegroundColor Yellow
+    $sizeBytes = (Get-ChildItem -Path $targetDir -Recurse -File -ErrorAction SilentlyContinue |
+                  Measure-Object -Property Length -Sum).Sum
+    if ($sizeBytes) {
+        Write-Host ("  Size on disk: {0:N2} GB" -f ($sizeBytes / 1GB)) -ForegroundColor Yellow
+    }
+
     if (-not $NoPrompt) {
-        $confirm = Read-Host "  Are you sure? (y/N)"
-        if ($confirm -notmatch "^y(es)?`$") {
-            Write-Host "  Aborted." -ForegroundColor Cyan
+        # Typing the name is deliberate friction: a bare y/N is too easy to
+        # answer on autopilot for something with no undo.
+        $confirm = Read-Host "  Type the VM name to confirm deletion"
+        if ($confirm -cne $VmName) {
+            Unlock-PvmVm -VmDir $targetDir
+            Write-Host "  Aborted - name did not match." -ForegroundColor Cyan
             exit 0
         }
     }
 
-    $files = Get-ChildItem -Path $targetDir -Recurse -File
-    $total = $files.Count + 1
-    $i = 0
+    Write-Host "  Removing..." -ForegroundColor Gray
+    # Release first: the lock directory lives inside the tree being deleted.
+    Unlock-PvmVm -VmDir $targetDir
+    Remove-Item -Path $targetDir -Recurse -Force -ErrorAction SilentlyContinue
 
-    foreach ($f in $files) {
-        $i++
-        Write-Progress -Activity "Deleting VM '$VmName'" -Status "Removing: $($f.Name)" -PercentComplete (($i / $total) * 100)
-        Remove-Item -Path $f.FullName -Force -ErrorAction SilentlyContinue
+    if (Test-Path $targetDir) {
+        Write-Host "  [!] Failed to fully delete '$targetDir'." -ForegroundColor Red
+        exit 1
     }
 
-    Write-Progress -Activity "Deleting VM '$VmName'" -Status "Removing directory..." -PercentComplete (($total / $total) * 100)
-    Remove-Item -Path $targetDir -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Progress -Activity "Deleting VM '$VmName'" -Completed
-
-    Write-Host "  [+] Successfully deleted VM '$VmName'." -ForegroundColor Green
+    Write-Host "  [+] Deleted VM '$VmName'." -ForegroundColor Green
     exit 0
 }
 
@@ -150,6 +180,7 @@ if (Test-Path $vmsDir) {
             Name          = $dir.Name
             FullPath      = $dir.FullName
             DiskSizeBytes = $diskSize
+            IsRunning     = (Test-PvmVmLocked -VmDir $dir.FullName)
         }
     }
 }
@@ -188,7 +219,20 @@ if (-not $decision.IsValid) {
     exit 1
 }
 
-# 5. Interactive Configuration Review (if not in non-interactive/dry-run mode)
+# 5. Single-instance lock.
+# Taken before the interactive review, not just before launch: there is no
+# point walking the user through a configuration menu for a VM they cannot
+# start. A dry run never launches anything, so it never takes the lock.
+if (-not $DryRun) {
+    $lock = Lock-PvmVm -VmDir $selectedVm.FullPath
+    if (-not $lock.Acquired) {
+        Write-Host "  [!] VM '$($decision.VmName)' is already running (locked by $($lock.Owner))." -ForegroundColor Red
+        Write-Host "      Two QEMU processes sharing one disk image will corrupt it." -ForegroundColor DarkGray
+        exit 1
+    }
+}
+
+# 6. Interactive Configuration Review (if not in non-interactive/dry-run mode)
 if (-not $NoPrompt -and -not $DryRun) {
     $proceed = Invoke-InteractiveConfigMenu -Decision $decision -HostInfo $hostInfo
     if (-not $proceed) {
@@ -197,7 +241,7 @@ if (-not $NoPrompt -and -not $DryRun) {
     }
 }
 
-# 6. Build QEMU Command Line
+# 7. Build QEMU Command Line
 $cmdSpec = Build-QemuCommand -Decision $decision
 
 Write-Host "  [+] GENERATED QEMU COMMAND" -ForegroundColor Green
@@ -214,13 +258,18 @@ if ($DryRun) {
 Write-Host "  [*] Launching Virtual Machine '$($decision.VmName)'..." -ForegroundColor Green
 Write-Host ""
 
-# 7. Execute QEMU process
+# 8. Execute QEMU process
 try {
-    $process = Start-Process -FilePath $cmdSpec.Executable -ArgumentList $cmdSpec.Arguments -Wait -PassThru -NoNewWindow
+    # ArgumentString, not Arguments: Windows PowerShell 5.1 joins an
+    # -ArgumentList array with plain spaces and adds no quoting, so any path
+    # containing a space would arrive at QEMU split into two arguments.
+    $process = Start-Process -FilePath $cmdSpec.Executable -ArgumentList $cmdSpec.ArgumentString -Wait -PassThru -NoNewWindow
     Write-Host "  [+] Virtual Machine session terminated with exit code $($process.ExitCode)." -ForegroundColor Cyan
     exit $process.ExitCode
 } catch {
     Write-Host "  [X] Failed to launch QEMU: $_" -ForegroundColor Red
     exit 1
+} finally {
+    Unlock-PvmVm -VmDir $selectedVm.FullPath
 }
 

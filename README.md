@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>🚀 PortableVM (v0.1-beta)</h1>
+  <h1>🚀 PortableVM (v0.2)</h1>
   <p><strong>Your entire operating system in your pocket. Plug it in. Run it anywhere.</strong></p>
 </div>
 
@@ -58,13 +58,71 @@ If you don't need the GUI and just want to boot your default VM immediately from
 
 ---
 
-## ⚡ Virtualization Acceleration (Optional but Recommended)
+## ⚡ Virtualization Acceleration
 
-For maximum performance, PortableVM attempts to use hardware acceleration. Ensure your host machine has virtualization enabled in the BIOS.
+PortableVM does not assume acceleration is available — it measures it, and tells
+you in the launch summary which accelerator it picked and why.
 
-- **Windows**: Ensure **Windows Hypervisor Platform** is enabled in Windows Features.
-- **Linux**: Ensure your user has access to `/dev/kvm`.
-- **macOS**: Hypervisor.framework (`HVF`) is enabled automatically on modern macOS.
+- **Windows**: enable **Windows Hypervisor Platform** in Windows Features and
+  reboot. The launcher confirms WHPX by briefly starting QEMU with it, because
+  the accelerator being compiled in is not the same as it being usable.
+- **Linux**: your user needs read *and* write access to `/dev/kvm` — usually
+  `sudo usermod -aG kvm $USER`, then log out and back in.
+- **macOS**: Hypervisor.framework is used automatically.
+
+**Hardware acceleration requires the guest architecture to match the host.**
+An x86_64 guest on an Apple Silicon or ARM64 Windows machine can only run under
+TCG software emulation, which is dramatically slower. `config.json` ships with
+`"arch": "x86_64"`; set it to `"host"` to make new VMs match whatever machine
+they are created on.
 
 ---
-*PortableVM is currently in v0.1-beta.*
+
+## ⚙️ Configuration
+
+`config.json` at the root of the drive holds the defaults for every VM, and both
+the PowerShell and the Bash launcher read the same file.
+
+| Key | Meaning |
+| --- | --- |
+| `vm_defaults.memory_percent` | Share of total host RAM to allocate. |
+| `vm_defaults.host_reserve_mb` | RAM held back for the host OS. |
+| `vm_defaults.arch` | Guest architecture: `x86_64`, `aarch64`, or `host`. |
+| `vm_defaults.display` | Preferred display backend; falls back automatically if this QEMU lacks it. |
+| `vm_defaults.disk_cache` | `auto` picks `writeback` for qcow2 and `writethrough` for raw. |
+| `vm_defaults.audio` | `auto`, `off`, or an explicit QEMU audiodev name. |
+| `guest_arch.<arch>` | Machine type, CPU model, GPU device and firmware filenames per architecture. |
+| `host_accel` / `host_audio` | Per-host-OS accelerator and audio backend. |
+
+Each VM can override any of these in its own `vms/<name>/vm.conf`:
+
+```ini
+name=ubuntu
+arch=aarch64
+memory_mb=8192
+cores=4
+display=gtk
+ssh_port=2222
+uefi=true
+```
+
+`arch` is written into `vm.conf` when a VM is created, because a disk image is
+architecture-specific — changing the global default later must not silently
+repoint an existing VM at a different guest platform.
+
+---
+
+## 🔒 Safety Behaviour
+
+- **Single instance per VM.** A `.pvm-lock` directory is created next to the disk
+  image while a VM runs. Two QEMU processes writing one qcow2 image corrupt it,
+  usually with no error until the guest filesystem stops mounting. A lock left
+  behind by a crashed launcher is detected and reclaimed automatically.
+- **Persistent UEFI variables.** Each VM gets its own writable `uefi_vars.fd`
+  alongside the shared read-only firmware, so boot entries survive — without it
+  a freshly installed OS drops to the EFI shell on its second start.
+- **Deletion asks you to type the VM name.** There is no undo, and the disk image
+  is usually the only copy of the guest.
+
+---
+*PortableVM is currently at v0.2.*

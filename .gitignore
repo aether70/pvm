@@ -1,2 +1,29 @@
-vms/omarchy/*
-backends/windows/qemu/*
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / agent state
+.kiro/
+
+# VM instances: keep the directory layout, never the images or runtime state
+vms/*/
+!vms/README.md
+*.qcow2
+*.raw
+*.img
+*.iso
+*.lock
+*_VARS.fd
+uefi_vars.fd
+
+# Single-instance guard, created next to a running VM's disk image
+.pvm-lock/
+
+# Bundled QEMU backends (downloaded per-host, never committed)
+backends/*/qemu/
+
+# Installer / launcher runtime artifacts
+_install_manifest.json
+.cache/
+*.log

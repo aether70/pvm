@@ -37,8 +37,15 @@ function Show-HostInfo {
 
     $qemuStatus = if ($HostInfo.QemuPath) { "$($HostInfo.QemuVersion) ($($HostInfo.QemuPath))" } else { "NOT FOUND" }
     $qemuColor = if ($HostInfo.QemuPath) { "White" } else { "Red" }
-    Write-Host ("  {0,-20} : " -f "QEMU Binary") -NoNewline
+    Write-Host ("  {0,-20} : " -f "QEMU ($($HostInfo.QemuArch))") -NoNewline
     Write-Host $qemuStatus -ForegroundColor $qemuColor
+
+    if ($HostInfo.QemuPath) {
+        # The probed lists are what the decision engine reasons over; showing
+        # them makes "why is it using TCG?" answerable at a glance.
+        Write-Host ("  {0,-20} : {1}" -f "  Accelerators", ($HostInfo.QemuAccelerators -join " "))
+        Write-Host ("  {0,-20} : {1}" -f "  Displays", ($HostInfo.QemuDisplays -join " "))
+    }
 
     if ($HostInfo.SsdFreeSpaceGB -gt 0) {
         Write-Host ("  {0,-20} : {1} GB" -f "SSD Free Space", $HostInfo.SsdFreeSpaceGB)
@@ -70,7 +77,12 @@ function Show-VmSelectionMenu {
             "No disk file"
         }
         $num = "[{0}]" -f ($i + 1)
-        Write-Host ("  {0,4} {1,-28} (Disk: {2})" -f $num, $vm.Name, $diskSizeStr) -ForegroundColor Cyan
+        Write-Host ("  {0,4} {1,-28} (Disk: {2})" -f $num, $vm.Name, $diskSizeStr) -NoNewline -ForegroundColor Cyan
+        if ($vm.PSObject.Properties['IsRunning'] -and $vm.IsRunning) {
+            Write-Host "  [running]" -ForegroundColor Yellow
+        } else {
+            Write-Host ""
+        }
     }
     Write-Host ""
 
@@ -109,6 +121,7 @@ function Show-DecisionSummary {
     Write-Host "  [+] ALLOCATED VM CONFIGURATION" -ForegroundColor Green
     Write-Host "  ----------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host ("  {0,-20} : {1}" -f "Selected VM", $Decision.VmName)
+    Write-Host ("  {0,-20} : {1}" -f "Guest Platform", "$($Decision.Arch) (machine $($Decision.Machine), cpu $($Decision.CpuModel))")
     Write-Host ("  {0,-20} : {1}" -f "Virtual Disk", $Decision.DiskPath)
 
     $ramLimitInfo = if ($Decision.SafeMaxRamMB) { " [Safe Range: $($Decision.MinRequiredRamMB) - $($Decision.SafeMaxRamMB) MB]" } else { "" }
@@ -132,9 +145,31 @@ function Show-DecisionSummary {
         Write-Host $Decision.AccelWarning -ForegroundColor Yellow
     }
 
+    Write-Host ("  {0,-20} : {1}" -f "Graphics", $Decision.VgaDevice)
     Write-Host ("  {0,-20} : {1}" -f "Display Output", $Decision.DisplayMode)
-    Write-Host ("  {0,-20} : {1} (Guest Port 22 -> Host Port {2})" -f "Network Mode", $Decision.NetworkMode, $Decision.SshPort)
-    Write-Host ("  {0,-20} : {1}" -f "UEFI Boot", $(if ($Decision.UseUefi) { "Enabled" } else { "Disabled" }))
+    Write-Host ("  {0,-20} : {1}" -f "Audio", $(if ($Decision.AudioDev) { $Decision.AudioDev } else { "disabled" }))
+    if ($Decision.NetworkMode -eq "nat") {
+        Write-Host ("  {0,-20} : NAT (ssh to 127.0.0.1:{1} -> guest :22)" -f "Network Mode", $Decision.SshPort)
+    } else {
+        Write-Host ("  {0,-20} : {1}" -f "Network Mode", $Decision.NetworkMode)
+    }
+
+    if ($Decision.UseUefi) {
+        Write-Host ("  {0,-20} : Enabled" -f "UEFI Boot")
+        Write-Host ("  {0,-20} : {1}" -f "  Firmware", $(if ($Decision.UefiCode) { $Decision.UefiCode } else { "<none>" }))
+        Write-Host ("  {0,-20} : {1}" -f "  Variables", $(if ($Decision.UefiVars) { $Decision.UefiVars } else { "<not persisted>" }))
+    } else {
+        Write-Host ("  {0,-20} : Disabled (legacy BIOS)" -f "UEFI Boot")
+    }
+
+    # Every downgrade the engine had to make, so surprises surface before the
+    # launch rather than as a QEMU error afterwards.
+    if ($Decision.PSObject.Properties['Warnings'] -and $Decision.Warnings) {
+        foreach ($w in $Decision.Warnings) {
+            Write-Host "  [!] " -NoNewline -ForegroundColor Yellow
+            Write-Host $w -ForegroundColor Yellow
+        }
+    }
     Write-Host ""
 }
 
@@ -183,7 +218,7 @@ function Invoke-InteractiveConfigMenu {
                 $ramInput = Read-Host
                 if ($ramInput -match "^\d+$") {
                     $newRam = [int]$ramInput
-                    $warnings = Test-MemorySafety -RamMB $newRam -HostInfo $HostInfo
+                    $warnings = Test-MemorySafety -RamMB $newRam -HostInfo $HostInfo -SafeMaxRamMB $Decision.SafeMaxRamMB
                     
                     if ($warnings.Count -gt 0) {
                         Write-Host ""
@@ -243,14 +278,31 @@ function Invoke-InteractiveConfigMenu {
             "3" {
                 Write-Host ""
                 Write-Host "  --- MODIFY DISPLAY BACKEND ---" -ForegroundColor Cyan
-                Write-Host "  Available options: [1] sdl (window), [2] gtk, [3] vnc (headless), [4] default"
-                Write-Host "  Select display option (1-4): " -NoNewline -ForegroundColor Yellow
+                # Only backends this QEMU actually built in are offered.
+                # Picking one it lacks is an immediate launch failure, and
+                # "default" was never a valid -display value at all.
+                $options = @()
+                foreach ($d in $HostInfo.QemuDisplays) {
+                    if ($d -in @("none", "dbus")) { continue }
+                    $options += $d
+                }
+                $options += "vnc"
+
+                for ($oi = 0; $oi -lt $options.Count; $oi++) {
+                    Write-Host ("   [{0}] {1}" -f ($oi + 1), $options[$oi])
+                }
+                Write-Host "  Select display option (1-$($options.Count)): " -NoNewline -ForegroundColor Yellow
                 $dispChoice = Read-Host
-                switch ($dispChoice.Trim()) {
-                    "1" { $Decision.DisplayMode = "sdl"; Write-Host "  [+] Display set to SDL." -ForegroundColor Green }
-                    "2" { $Decision.DisplayMode = "gtk"; Write-Host "  [+] Display set to GTK." -ForegroundColor Green }
-                    "3" { $Decision.DisplayMode = "vnc"; Write-Host "  [+] Display set to VNC (127.0.0.1:0)." -ForegroundColor Green }
-                    "4" { $Decision.DisplayMode = "default"; Write-Host "  [+] Display set to default." -ForegroundColor Green }
+                if ($dispChoice -match "^\d+$") {
+                    $di = [int]$dispChoice - 1
+                    if ($di -ge 0 -and $di -lt $options.Count) {
+                        $Decision.DisplayMode = $options[$di]
+                        Write-Host "  [+] Display set to $($Decision.DisplayMode)." -ForegroundColor Green
+                    } else {
+                        Write-Host "  [!] Invalid choice - unchanged." -ForegroundColor Red
+                    }
+                } else {
+                    Write-Host "  [!] Invalid choice - unchanged." -ForegroundColor Red
                 }
                 Write-Host ""
             }

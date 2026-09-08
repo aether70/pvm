@@ -23,6 +23,7 @@ if (Test-Path (Join-Path $ScriptDir "vms")) {
 . (Join-Path $ScriptDir "detect.ps1")
 . (Join-Path $ScriptDir "decide.ps1")
 . (Join-Path $ScriptDir "build_command.ps1")
+. (Join-Path $ScriptDir "lock.ps1")
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -53,13 +54,36 @@ if ($initialVmName) {
     $initialVmDir = Join-Path $vmsDir $initialVmName
     $initialDecision = Invoke-DecisionEngine -HostInfo $hostInfo -RootDir $RootDir -VmDir $initialVmDir
 } else {
+    # Placeholder for the empty state. It carries every field the form reads,
+    # so binding the controls does not depend on a VM existing yet.
     $initialDecision = [PSCustomObject]@{
         VmName = ""
+        VmDir = ""
+        Arch = $hostInfo.Architecture
+        Machine = "q35"
+        CpuModel = "max"
         DiskPath = ""
+        DiskFormat = "qcow2"
+        DiskCache = "writeback"
+        IsoPath = ""
         AllocatedRamMB = 2048
         AllocatedCores = 2
+        SafeMaxRamMB = [math]::Max(1024, $hostInfo.AvailableRamMB - 1536)
+        MinRequiredRamMB = 1024
+        MaxHostCores = $hostInfo.LogicalCores
         DisplayMode = "sdl"
+        VgaDevice = ""
+        UseGl = $false
+        AudioDev = ""
+        NetworkMode = "nat"
+        SshPort = 2222
+        UseUefi = $false
+        UefiCode = $null
+        UefiVars = $null
         Accelerator = if ($hostInfo.WhpxAvailable) { "whpx" } else { "tcg" }
+        AccelWarning = $null
+        QemuExe = $hostInfo.QemuPath
+        Warnings = @()
         IsValid = $false
         Errors = @("No virtual machines found. Click '+ New VM' to create one.")
     }
@@ -68,6 +92,10 @@ if ($initialVmName) {
 # Acceleration status string
 $accelStatus = "TCG Emulation (Slow)"
 if ($hostInfo.WhpxAvailable) { $accelStatus = "WHPX Hardware Accelerated (Fast)" }
+
+# Tracks the VM process, its progress bar and its poll timer while one is
+# running; $null the rest of the time.
+$script:runState = $null
 
 # Construct Form
 $form = New-Object System.Windows.Forms.Form
@@ -272,8 +300,19 @@ $cmbDisplay.Font = $fontRegular
 $cmbDisplay.DropDownStyle = "DropDownList"
 $cmbDisplay.Location = New-Object System.Drawing.Point(160, 222)
 $cmbDisplay.Size = New-Object System.Drawing.Size(120, 25)
-$cmbDisplay.Items.AddRange(@("sdl", "gtk", "vnc"))
+# Only the backends this QEMU actually built in - offering one it lacks turns
+# the Launch button into an immediate QEMU error. -vnc is always available as
+# an option because it is a separate switch, not a -display backend.
+$displayOptions = @()
+foreach ($d in $hostInfo.QemuDisplays) {
+    if ($d -in @("none", "dbus")) { continue }
+    $displayOptions += $d
+}
+$displayOptions += "vnc"
+if ($displayOptions.Count -eq 1) { $displayOptions = @("sdl", "gtk", "vnc") }
+$cmbDisplay.Items.AddRange($displayOptions)
 $cmbDisplay.SelectedItem = $initialDecision.DisplayMode
+if (-not $cmbDisplay.SelectedItem) { $cmbDisplay.SelectedIndex = 0 }
 $gbVm.Controls.Add($cmbDisplay)
 
 # Accelerator
@@ -289,8 +328,19 @@ $cmbAccel.Font = $fontRegular
 $cmbAccel.DropDownStyle = "DropDownList"
 $cmbAccel.Location = New-Object System.Drawing.Point(400, 222)
 $cmbAccel.Size = New-Object System.Drawing.Size(140, 25)
-$cmbAccel.Items.AddRange(@("whpx", "tcg"))
+# Same rule for accelerators, with the extra condition that a hardware
+# accelerator is only offered when detection actually managed to start QEMU
+# with it - "compiled in" is not the same as "usable on this machine".
+$accelOptions = @()
+if ($hostInfo.WhpxAvailable) { $accelOptions += "whpx" }
+foreach ($a in $hostInfo.QemuAccelerators) {
+    if ($a -eq "whpx") { continue }
+    $accelOptions += $a
+}
+if ($accelOptions.Count -eq 0) { $accelOptions = @("tcg") }
+$cmbAccel.Items.AddRange($accelOptions)
 $cmbAccel.SelectedItem = $initialDecision.Accelerator
+if (-not $cmbAccel.SelectedItem) { $cmbAccel.SelectedIndex = 0 }
 $gbVm.Controls.Add($cmbAccel)
 
 # Status / Validation Message Box
@@ -333,14 +383,20 @@ function Update-Diagnostics {
 
     if ($selectedVm) {
         $targetVmDir = Join-Path $vmsDir $selectedVm
-        $script:currentDecision = Invoke-DecisionEngine -HostInfo $hostInfo -RootDir $RootDir -VmDir $targetVmDir
+        $script:currentDecision = Invoke-DecisionEngine -HostInfo $hostInfo -RootDir $RootDir `
+                                                        -VmDir $targetVmDir -IsoPath $existingIso
         $script:currentDecision.AllocatedRamMB = $ramVal
         $script:currentDecision.AllocatedCores = $cpuVal
-        $script:currentDecision.DisplayMode = $cmbDisplay.SelectedItem
-        $script:currentDecision.Accelerator = $cmbAccel.SelectedItem
-        
-        if ($existingIso) {
-            $script:currentDecision | Add-Member -NotePropertyName IsoPath -NotePropertyValue $existingIso -Force
+        if ($cmbDisplay.SelectedItem) { $script:currentDecision.DisplayMode = $cmbDisplay.SelectedItem }
+        if ($cmbAccel.SelectedItem)   { $script:currentDecision.Accelerator = $cmbAccel.SelectedItem }
+
+        # The accelerator is a user choice in this form, so the CPU model has
+        # to follow it: -cpu host is only valid when a hypervisor is passing
+        # the real CPU through, and TCG rejects it.
+        if ($script:currentDecision.Accelerator -eq "tcg") {
+            $script:currentDecision.CpuModel = "max"
+        } elseif ($script:currentDecision.Accelerator -eq "whpx") {
+            $script:currentDecision.CpuModel = "max,vmx=off"
         }
 
         $statusMsg = "Ready to Launch."
@@ -434,51 +490,125 @@ $btnLaunch.add_Click({
         [System.Windows.Forms.MessageBox]::Show("Please select a valid VM first.", "Error", 0, 16)
         return
     }
+
+    $vmDir = $script:currentDecision.VmDir
+
+    # Two QEMU processes writing one qcow2 image corrupt it, and the GUI is
+    # the easiest way to start a second one: the window stays open while the
+    # VM runs, so the Launch button is right there to press again.
+    $lock = Lock-PvmVm -VmDir $vmDir
+    if (-not $lock.Acquired) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "This VM is already running (locked by $($lock.Owner))." + [Environment]::NewLine + [Environment]::NewLine +
+            "Two QEMU processes sharing one disk image will corrupt it.",
+            "Already Running",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        return
+    }
+
     $cmdSpec = Build-QemuCommand -Decision $script:currentDecision
-    
+
     $btnLaunch.Enabled = $false
     $btnLaunch.Text = "Running..."
-    $lblStatus.Text = "Status: VM is currently running in background..."
-    
+    $lblStatus.Text = "Status: VM is currently running..."
+
+    # Marquee animates itself on the UI thread's own timer. The previous
+    # version hand-stepped a Continuous bar inside a
+    # `while (-not HasExited) { DoEvents; Sleep 20 }` loop, which pinned a core
+    # for the entire VM session and froze the window whenever a DoEvents
+    # re-entered this same handler.
     $pbRun = New-Object System.Windows.Forms.ProgressBar
     $pbRun.Location = New-Object System.Drawing.Point(20, 560)
     $pbRun.Size = New-Object System.Drawing.Size(564, 15)
-    $pbRun.Style = "Continuous"
+    $pbRun.Style = "Marquee"
+    $pbRun.MarqueeAnimationSpeed = 30
     $form.Controls.Add($pbRun)
 
     try {
-        $process = Start-Process -FilePath $cmdSpec.Executable -ArgumentList $cmdSpec.Arguments -PassThru -NoNewWindow
-        
-        $val = 0
-        $dir = 2
-        while (-not $process.HasExited) {
-            $val += $dir
-            if ($val -ge 100) { $val = 100; $dir = -2 }
-            if ($val -le 0) { $val = 0; $dir = 2 }
-            $pbRun.Value = $val
-            [System.Windows.Forms.Application]::DoEvents()
-            Start-Sleep -Milliseconds 20
-        }
-
-        [System.Windows.Forms.MessageBox]::Show(
-            "Virtual Machine session ended (Exit Code: $($process.ExitCode)).",
-            "Portable VM Session Ended",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Information
-        )
+        # ArgumentString, not Arguments: Windows PowerShell 5.1 joins an
+        # -ArgumentList array with plain spaces and adds no quoting of its own,
+        # so any path containing a space would reach QEMU split in two.
+        $process = Start-Process -FilePath $cmdSpec.Executable `
+                                 -ArgumentList $cmdSpec.ArgumentString `
+                                 -PassThru -NoNewWindow
     } catch {
+        Unlock-PvmVm -VmDir $vmDir
+        $form.Controls.Remove($pbRun)
+        $pbRun.Dispose()
+        $btnLaunch.Enabled = $true
+        $btnLaunch.Text = "Launch VM"
         [System.Windows.Forms.MessageBox]::Show(
             "Failed to launch QEMU: $_",
             "Launch Error",
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Error
         )
+        return
     }
-    
-    $form.Controls.Remove($pbRun)
-    $btnLaunch.Enabled = $true
-    $btnLaunch.Text = "Launch VM"
-    Update-Diagnostics
+
+    # A WinForms timer polls twice a second on the normal message loop, so the
+    # window stays responsive (movable, closable, VM-switchable) for the whole
+    # session instead of being blocked until QEMU exits.
+    $watcher = New-Object System.Windows.Forms.Timer
+    $watcher.Interval = 500
+    $script:runState = [PSCustomObject]@{
+        Process = $process
+        Bar     = $pbRun
+        Timer   = $watcher
+        VmDir   = $vmDir
+    }
+
+    $watcher.add_Tick({
+        $state = $script:runState
+        if (-not $state -or -not $state.Process.HasExited) { return }
+
+        $state.Timer.Stop()
+        $state.Timer.Dispose()
+        Unlock-PvmVm -VmDir $state.VmDir
+
+        $form.Controls.Remove($state.Bar)
+        $state.Bar.Dispose()
+        $btnLaunch.Enabled = $true
+        $btnLaunch.Text = "Launch VM"
+        $lblStatus.Text = "Status: Idle"
+
+        $exitCode = $state.Process.ExitCode
+        $script:runState = $null
+        Update-Diagnostics
+
+        [System.Windows.Forms.MessageBox]::Show(
+            "Virtual Machine session ended (exit code $exitCode).",
+            "Portable VM Session Ended",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        )
+    })
+    $watcher.Start()
+})
+
+# Closing the window while a VM is running would otherwise strand the lock
+# directory, and every later launch would refuse until it was deleted by hand.
+$form.add_FormClosing({
+    if ($script:runState) {
+        $script:runState.Timer.Stop()
+        if (-not $script:runState.Process.HasExited) {
+            $answer = [System.Windows.Forms.MessageBox]::Show(
+                "A virtual machine is still running. Close the launcher anyway?" + [Environment]::NewLine + [Environment]::NewLine +
+                "The VM keeps running; its lock is released so you can reattach from a new launcher.",
+                "VM Still Running",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
+                $_.Cancel = $true
+                $script:runState.Timer.Start()
+                return
+            }
+        }
+        Unlock-PvmVm -VmDir $script:runState.VmDir
+    }
 })
 
 # Show Form
