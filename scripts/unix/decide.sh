@@ -228,7 +228,17 @@ run_decision_engine() {
         if [ "$VIRT_HW_SUPPORT" -ne 1 ]; then
             DECISION_ACCEL_WARN="CPU virtualization (VT-x/AMD-V) is disabled in firmware. Enable it in BIOS/UEFI to use KVM. Running under $fallback emulation."
         else
-            DECISION_ACCEL_WARN="/dev/kvm is not readable and writable by this user. Add yourself to the 'kvm' group and re-login. Running under $fallback emulation."
+            DECISION_ACCEL_WARN="KVM unavailable or /dev/kvm not writable. Running with TCG software emulation."
+        fi
+    elif [ "$HOST_OS" = "Darwin" ]; then
+        if [ "$HVF_AVAILABLE" -eq 1 ]; then
+            DECISION_ACCEL="hvf"
+        else
+            if [[ "$HOST_ARCH" == "arm64" && "$TARGET_ARCH" == "x86_64" ]]; then
+                DECISION_ACCEL_WARN="Cross-architecture virtualization (x86_64 guest on Apple Silicon host) does not support HVF. Running with TCG software emulation."
+            else
+                DECISION_ACCEL_WARN="HVF unavailable. Running with TCG software emulation."
+            fi
         fi
     elif [ "$preferred" = "hvf" ] && [ "$HVF_AVAILABLE" -ne 1 ]; then
         DECISION_ACCEL_WARN="Hypervisor.framework is unavailable on this Mac. Running under $fallback emulation."

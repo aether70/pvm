@@ -24,10 +24,30 @@ build_qemu_command() {
     # ---- Identity -------------------------------------------------------
     QEMU_ARGS+=("-name" "$DECISION_VM_NAME")
 
-    # ---- Machine + accelerator -----------------------------------------
-    local machine="${DECISION_MACHINE:-q35},accel=${DECISION_ACCEL:-tcg}"
-    QEMU_ARGS+=("-machine" "$machine")
-    QEMU_ARGS+=("-cpu" "${DECISION_CPU:-max}")
+    # 2. Machine and Accelerator
+    local machine_type="q35"
+    if [ "$TARGET_ARCH" = "aarch64" ]; then
+        machine_type="virt"
+    fi
+
+    if [ "$DECISION_ACCEL" = "tcg" ]; then
+        QEMU_ARGS+=("-machine" "${machine_type},accel=tcg")
+    else
+        QEMU_ARGS+=("-machine" "${machine_type},accel=$DECISION_ACCEL")
+    fi
+
+    # 3. CPU model
+    if [ "$DECISION_ACCEL" = "kvm" ] || [ "$DECISION_ACCEL" = "hvf" ]; then
+        QEMU_ARGS+=("-cpu" "host")
+    else
+        if [ "$TARGET_ARCH" = "aarch64" ]; then
+            QEMU_ARGS+=("-cpu" "cortex-a72")
+        else
+            QEMU_ARGS+=("-cpu" "max")
+        fi
+    fi
+
+    # 4. SMP & Memory
     QEMU_ARGS+=("-smp" "$DECISION_CORES")
     QEMU_ARGS+=("-m" "$DECISION_RAM_MB")
 

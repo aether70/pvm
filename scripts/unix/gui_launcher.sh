@@ -19,7 +19,7 @@ source "$SCRIPT_DIR/build_command.sh"
 source "$SCRIPT_DIR/lock.sh"
 source "$SCRIPT_DIR/setup_core.sh"
 
-config_load "$ROOT_DIR/config.json"
+detect_host_info "$ROOT_DIR"
 
 VMS_DIR="$ROOT_DIR/vms"
 DECISION_ISO=""
@@ -96,33 +96,71 @@ if [ -d "$VMS_DIR" ]; then
     done
 fi
 
-MENU=("[+ New VM]")
-if [ "${#VM_LIST[@]}" -gt 0 ]; then
-    MENU[${#MENU[@]}]="[- Delete VM]"
-    for name in "${VM_LIST[@]}"; do
-        MENU[${#MENU[@]}]="$name"
-    done
-fi
-
-PROMPT="Host: $HOST_OS ($HOST_ARCH) | Cores: $HOST_LOGICAL_CORES | Free RAM: ${HOST_AVAIL_RAM_MB} MB | Free disk: ${HOST_SSD_FREE_GB} GB"
-
-SELECTED_VM="$(gui_choose "$PROMPT" "${MENU[@]}")" || exit 0
-[ -n "$SELECTED_VM" ] || exit 0
-
-# ---- New VM --------------------------------------------------------------
-if [ "$SELECTED_VM" = "[+ New VM]" ]; then
-    if [ -z "$QEMU_IMG_PATH" ]; then
-        gui_error "qemu-img was not found. Install QEMU, or place a portable build under 'backends/'."
-        exit 1
+# GUI Logic using Zenity (Linux) or osascript (macOS) or CLI fallback
+if command -v zenity &>/dev/null; then
+    if [ ${#VM_LIST[@]} -eq 0 ]; then
+        VM_LIST_OPTS=("[+ New VM]")
+    else
+        VM_LIST_OPTS=("[+ New VM]" "[- Delete VM]" "${VM_LIST[@]}")
     fi
 
-    SETUP_VM_NAME="$(gui_entry "Name for the new VM:")" || exit 0
-    [ -n "$SETUP_VM_NAME" ] || exit 0
+    SELECTED_VM=$(zenity --list --title="Portable Virtual Computer Launcher" \
+        --column="Virtual Machines" "${VM_LIST_OPTS[@]}" \
+        --text="Select a VM instance or create a new one:\nHost: $HOST_OS ($HOST_ARCH) | Cores: $HOST_LOGICAL_CORES | RAM: ${HOST_AVAIL_RAM_MB}MB Free")
 
-    VAL_NAME="$(test_vm_name_valid "$SETUP_VM_NAME" "$VMS_DIR")"
-    if [ "${VAL_NAME%%|*}" = "false" ]; then
-        gui_error "${VAL_NAME#*|}"
-        exit 1
+    [ -z "$SELECTED_VM" ] && exit 0
+
+    if [ "$SELECTED_VM" = "[+ New VM]" ]; then
+        source "$SCRIPT_DIR/setup_core.sh"
+        
+        SETUP_VM_NAME=$(zenity --entry --title="New VM" --text="Enter a name for the new VM:")
+        [ -z "$SETUP_VM_NAME" ] && exit 0
+        
+        VAL_NAME=$(test_vm_name_valid "$SETUP_VM_NAME" "$VMS_DIR")
+        if [[ "$VAL_NAME" == false* ]]; then
+            zenity --error --title="Invalid Name" --text="${VAL_NAME#*|}"
+            exit 1
+        fi
+        
+        SETUP_ISO_PATH=$(zenity --file-selection --title="Select ISO File" --file-filter="*.iso")
+        [ -z "$SETUP_ISO_PATH" ] && exit 0
+        
+        VAL_ISO=$(test_iso_file_valid "$SETUP_ISO_PATH")
+        if [[ "$VAL_ISO" == false* ]]; then
+            IFS='|' read -ra ARR <<< "$VAL_ISO"
+            zenity --error --title="Invalid ISO" --text="${ARR[1]}"
+            exit 1
+        fi
+        
+        SETUP_DISK_SIZE=$(zenity --entry --title="Root Disk Size" --text="Enter virtual disk size in GB:" --entry-text="64")
+        [ -z "$SETUP_DISK_SIZE" ] && exit 0
+        
+        VAL_SPACE=$(test_disk_space_available "$SETUP_DISK_SIZE" "$HOST_SSD_FREE_GB")
+        if [[ "$VAL_SPACE" == false* ]]; then
+            IFS='|' read -ra ARR <<< "$VAL_SPACE"
+            zenity --error --title="Not Enough Space" --text="${ARR[2]}"
+            exit 1
+        fi
+        
+        zenity --info --title="Creating VM" --text="Creating virtual disk... This may take a moment." --timeout=2
+        
+        RES_NEW=$(new_vm_instance "$SETUP_VM_NAME" "$VMS_DIR" "$SETUP_DISK_SIZE" "$QEMU_PATH")
+        if [[ "$RES_NEW" == false* ]]; then
+            IFS='|' read -ra ARR <<< "$RES_NEW"
+            zenity --error --title="Error Creating VM" --text="${ARR[1]}"
+            exit 1
+        fi
+        
+        IFS='|' read -ra ARR <<< "$RES_NEW"
+        TARGET_DIR="${ARR[2]}"
+        
+        run_decision_engine "$ROOT_DIR" "$TARGET_DIR"
+        DECISION_UEFI="false"
+        DECISION_ISO="$SETUP_ISO_PATH"
+        
+        build_qemu_command
+        eval "$FULL_COMMAND_STR"
+        exit $?
     fi
 
     SETUP_ISO_PATH="$(gui_pick_iso)" || exit 0
@@ -134,59 +172,111 @@ if [ "$SELECTED_VM" = "[+ New VM]" ]; then
         exit 1
     fi
 
-    SETUP_DISK_SIZE="$(gui_entry "Virtual disk size in GB:" "64")" || exit 0
-    [ -n "$SETUP_DISK_SIZE" ] || exit 0
+    VM_DIR="$VMS_DIR/$SELECTED_VM"
+    run_decision_engine "$ROOT_DIR" "$VM_DIR"
 
-    VAL_SPACE="$(test_disk_space_available "$SETUP_DISK_SIZE" "$HOST_SSD_FREE_GB")"
-    SPACE_OK="$(printf '%s' "$VAL_SPACE" | cut -d'|' -f1)"
-    SPACE_LEVEL="$(printf '%s' "$VAL_SPACE" | cut -d'|' -f2)"
-    SPACE_MSG="$(printf '%s' "$VAL_SPACE" | cut -d'|' -f3)"
-    if [ "$SPACE_OK" = "false" ]; then
-        gui_error "$SPACE_MSG"
-        exit 1
-    elif [ "$SPACE_LEVEL" = "WARNING" ]; then
-        gui_confirm "$SPACE_MSG
-
-Continue anyway?" || exit 0
+    # Confirm launch with Zenity
+    if zenity --question --title="Launch VM" --text="Launch VM '$SELECTED_VM' with:\n- RAM: ${DECISION_RAM_MB} MB\n- Cores: ${DECISION_CORES}\n- Accel: ${DECISION_ACCEL}?"; then
+        build_qemu_command
+        zenity --info --title="Launching VM" --text="Starting QEMU session..." --timeout=2
+        "$QEMU_PATH" "${QEMU_ARGS[@]}"
     fi
 
-    RES_NEW="$(new_vm_instance "$SETUP_VM_NAME" "$VMS_DIR" "$SETUP_DISK_SIZE" "$QEMU_IMG_PATH" "$QEMU_ARCH")"
-    if [ "${RES_NEW%%|*}" = "false" ]; then
-        gui_error "$(printf '%s' "$RES_NEW" | cut -d'|' -f2-)"
-        exit 1
+elif [ "$(uname -s)" = "Darwin" ]; then
+    # macOS native AppleScript dialogs
+    if [ ${#VM_LIST[@]} -eq 0 ]; then
+        VM_OPTS_STR='"[+ New VM]"'
+    else
+        VM_OPTS_STR='"[+ New VM]", "[- Delete VM]"'
+        for vm in "${VM_LIST[@]}"; do
+            VM_OPTS_STR="$VM_OPTS_STR, \"$vm\""
+        done
     fi
 
-    TARGET_DIR="$(printf '%s' "$RES_NEW" | cut -d'|' -f3)"
+    SELECTED_VM=$(osascript -e "choose from list {$VM_OPTS_STR} with title \"Portable Virtual Computer\" with prompt \"Host: $HOST_OS ($HOST_ARCH) | Cores: $HOST_LOGICAL_CORES | Free RAM: ${HOST_AVAIL_RAM_MB}MB\nSelect VM instance:\" default items {\"[+ New VM]\"}" 2>/dev/null)
+    [ "$SELECTED_VM" = "false" ] || [ -z "$SELECTED_VM" ] && exit 0
 
-    run_decision_engine "$ROOT_DIR" "$TARGET_DIR"
-    DECISION_ISO="$SETUP_ISO_PATH"
+    if [ "$SELECTED_VM" = "[+ New VM]" ]; then
+        source "$SCRIPT_DIR/setup_core.sh"
 
-    if [ "$DECISION_IS_VALID" -ne 1 ]; then
-        gui_error "Cannot start the installer:$(decision_errors_text)"
-        exit 1
+        SETUP_VM_NAME=$(osascript -e 'text returned of (display dialog "Enter a name for the new VM:" default answer "" with title "New VM")' 2>/dev/null)
+        [ -z "$SETUP_VM_NAME" ] && exit 0
+
+        VAL_NAME=$(test_vm_name_valid "$SETUP_VM_NAME" "$VMS_DIR")
+        if [[ "$VAL_NAME" == false* ]]; then
+            osascript -e "display alert \"Invalid Name\" message \"${VAL_NAME#*|}\" as critical" 2>/dev/null
+            exit 1
+        fi
+
+        SETUP_ISO_PATH=$(osascript -e 'POSIX path of (choose file with prompt "Select ISO File:" of type {"iso"})' 2>/dev/null)
+        [ -z "$SETUP_ISO_PATH" ] && exit 0
+
+        VAL_ISO=$(test_iso_file_valid "$SETUP_ISO_PATH")
+        if [[ "$VAL_ISO" == false* ]]; then
+            IFS='|' read -ra ARR <<< "$VAL_ISO"
+            osascript -e "display alert \"Invalid ISO\" message \"${ARR[1]}\" as critical" 2>/dev/null
+            exit 1
+        fi
+
+        SETUP_DISK_SIZE=$(osascript -e 'text returned of (display dialog "Enter virtual disk size in GB:" default answer "64" with title "Root Disk Size")' 2>/dev/null)
+        SETUP_DISK_SIZE=${SETUP_DISK_SIZE:-64}
+
+        VAL_SPACE=$(test_disk_space_available "$SETUP_DISK_SIZE" "$HOST_SSD_FREE_GB")
+        if [[ "$VAL_SPACE" == false* ]]; then
+            IFS='|' read -ra ARR <<< "$VAL_SPACE"
+            osascript -e "display alert \"Not Enough Space\" message \"${ARR[2]}\" as critical" 2>/dev/null
+            exit 1
+        fi
+
+        RES_NEW=$(new_vm_instance "$SETUP_VM_NAME" "$VMS_DIR" "$SETUP_DISK_SIZE" "$QEMU_PATH")
+        if [[ "$RES_NEW" == false* ]]; then
+            IFS='|' read -ra ARR <<< "$RES_NEW"
+            osascript -e "display alert \"Error Creating VM\" message \"${ARR[1]}\" as critical" 2>/dev/null
+            exit 1
+        fi
+
+        IFS='|' read -ra ARR <<< "$RES_NEW"
+        TARGET_DIR="${ARR[2]}"
+
+        run_decision_engine "$ROOT_DIR" "$TARGET_DIR"
+        DECISION_UEFI="false"
+        DECISION_ISO="$SETUP_ISO_PATH"
+
+        build_qemu_command
+        "$QEMU_PATH" "${QEMU_ARGS[@]}"
+        exit $?
     fi
 
-    gui_confirm "Install '$SETUP_VM_NAME' from:
-$(basename "$SETUP_ISO_PATH")
+    if [ "$SELECTED_VM" = "[- Delete VM]" ]; then
+        VM_DEL_OPTS=""
+        for vm in "${VM_LIST[@]}"; do
+            if [ -n "$VM_DEL_OPTS" ]; then VM_DEL_OPTS="$VM_DEL_OPTS, "; fi
+            VM_DEL_OPTS="$VM_DEL_OPTS\"$vm\""
+        done
 
-$(decision_summary_text)" || exit 0
+        DEL_TARGET=$(osascript -e "choose from list {$VM_DEL_OPTS} with title \"Delete VM\" with prompt \"Select VM to permanently delete:\"" 2>/dev/null)
+        [ "$DEL_TARGET" = "false" ] || [ -z "$DEL_TARGET" ] && exit 0
 
-    launch_vm "$TARGET_DIR"
-    exit $?
-fi
+        CONFIRM=$(osascript -e "button returned of (display dialog \"Are you sure you want to permanently delete '$DEL_TARGET'? All VM disk data will be destroyed.\" with title \"Confirm Deletion\" buttons {\"Cancel\", \"Delete\"} default button \"Cancel\" with icon caution)" 2>/dev/null)
+        if [ "$CONFIRM" = "Delete" ]; then
+            rm -rf "$VMS_DIR/$DEL_TARGET"
+            osascript -e "display notification \"VM '$DEL_TARGET' was deleted successfully.\" with title \"Portable VM\"" 2>/dev/null
+        fi
+        exit 0
+    fi
 
-# ---- Delete VM -----------------------------------------------------------
-if [ "$SELECTED_VM" = "[- Delete VM]" ]; then
-    DEL_TARGET="$(gui_choose "Select the VM to delete:" "${VM_LIST[@]}")" || exit 0
-    [ -n "$DEL_TARGET" ] || exit 0
-    exec "$SCRIPT_DIR/delete_wizard.sh" "$DEL_TARGET" "$VMS_DIR"
-fi
+    VM_DIR="$VMS_DIR/$SELECTED_VM"
+    run_decision_engine "$ROOT_DIR" "$VM_DIR"
 
-# ---- Launch existing VM --------------------------------------------------
-VM_DIR="$VMS_DIR/$SELECTED_VM"
-if [ ! -d "$VM_DIR" ]; then
-    gui_error "VM '$SELECTED_VM' no longer exists."
-    exit 1
+    CONFIRM_MSG="Launch VM '$SELECTED_VM'?\n\n• RAM: ${DECISION_RAM_MB} MB\n• Cores: ${DECISION_CORES}\n• Hypervisor: ${DECISION_ACCEL}"
+    LAUNCH_CONFIRM=$(osascript -e "button returned of (display dialog \"$CONFIRM_MSG\" with title \"Launch VM\" buttons {\"Cancel\", \"Launch\"} default button \"Launch\")" 2>/dev/null)
+    if [ "$LAUNCH_CONFIRM" = "Launch" ]; then
+        build_qemu_command
+        "$QEMU_PATH" "${QEMU_ARGS[@]}"
+    fi
+else
+    # Fallback to Terminal Interactive Launcher
+    exec "$SCRIPT_DIR/launcher.sh"
 fi
 
 run_decision_engine "$ROOT_DIR" "$VM_DIR"

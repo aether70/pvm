@@ -221,56 +221,76 @@ detect_host_info() {
         [ "${HOST_AVAIL_RAM_MB:-0}" -gt 0 ] 2>/dev/null || \
             HOST_AVAIL_RAM_MB=$(( HOST_TOTAL_RAM_MB / 2 ))
 
-        # Hypervisor.framework is present on every supported macOS, but only
-        # for guests matching the host architecture. sysctl reports whether the
-        # CPU can host it at all; the per-guest answer comes from -accel help.
-        if [ "$(sysctl -n kern.hv_support 2>/dev/null || echo 0)" = "1" ]; then
-            VIRT_HW_SUPPORT=1
-            HOST_HVF_OK=1
+        VIRT_HW_SUPPORT=1
+    fi
+
+    # 2. Resolve Target Architecture & Locate QEMU Binary
+    TARGET_ARCH="x86_64"
+    if [ -f "$root_dir/config.json" ]; then
+        local cfg_arch
+        cfg_arch=$(grep -o '"arch"[^:]*:[^"]*"[^"]*"' "$root_dir/config.json" 2>/dev/null | head -n1 | cut -d'"' -f4)
+        if [ -n "$cfg_arch" ]; then
+            TARGET_ARCH="$cfg_arch"
         fi
     fi
 
-    [ "${HOST_LOGICAL_CORES:-0}" -ge 1 ] 2>/dev/null || HOST_LOGICAL_CORES=1
-    [ "${HOST_TOTAL_RAM_MB:-0}" -ge 1 ] 2>/dev/null || HOST_TOTAL_RAM_MB=2048
-    [ "${HOST_AVAIL_RAM_MB:-0}" -ge 1 ] 2>/dev/null || HOST_AVAIL_RAM_MB=1024
-
-    # Free space on the volume holding the VM images, in GB. -P forces the
-    # single-line POSIX format so the awk column index is stable.
-    HOST_SSD_FREE_GB="$(df -Pk "$root_dir" 2>/dev/null | awk 'NR == 2 { print int($4 / 1048576) }')"
-    [ -n "$HOST_SSD_FREE_GB" ] || HOST_SSD_FREE_GB=0
-
-    # QEMU for the guest architecture we intend to run. Falls back to the host
-    # architecture, then to x86_64, so a config typo still finds something.
-    [ -n "$guest_arch" ] || guest_arch="$(config_get 'vm_defaults.arch' "$HOST_ARCH")"
-    local try
-    for try in "$guest_arch" "$HOST_ARCH" x86_64; do
-        [ -n "$try" ] || continue
-        if QEMU_PATH="$(pvm_find_qemu "$root_dir" "$try")"; then
-            QEMU_ARCH="$try"
-            break
+    # If host is Apple Silicon / ARM64 and target is x86_64, check if native aarch64 binary exists
+    if [[ ("$HOST_ARCH" == "arm64" || "$HOST_ARCH" == "aarch64") && "$TARGET_ARCH" == "x86_64" ]]; then
+        if ! command -v qemu-system-x86_64 >/dev/null 2>&1 && command -v qemu-system-aarch64 >/dev/null 2>&1; then
+            TARGET_ARCH="aarch64"
         fi
-        QEMU_PATH=""
-    done
+    fi
 
-    QEMU_IMG_PATH="$(pvm_find_qemu_img "$root_dir")" || QEMU_IMG_PATH=""
+    local qemu_bin="qemu-system-$TARGET_ARCH"
+    local qemu_search_paths=(
+        "$root_dir/backends/linux/qemu/$qemu_bin"
+        "/opt/homebrew/bin/$qemu_bin"
+        "/usr/local/bin/$qemu_bin"
+        "/usr/bin/$qemu_bin"
+    )
+
+    if command -v "$qemu_bin" >/dev/null 2>&1; then
+        QEMU_PATH=$(command -v "$qemu_bin")
+    else
+        for p in "${qemu_search_paths[@]}"; do
+            if [ -x "$p" ]; then
+                QEMU_PATH="$p"
+                break
+            fi
+        done
+    fi
+
+    # Fallback to general qemu-system-x86_64 if TARGET_ARCH was not found
+    if [ -z "$QEMU_PATH" ] && [ "$TARGET_ARCH" != "x86_64" ]; then
+        if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+            QEMU_PATH=$(command -v qemu-system-x86_64)
+            TARGET_ARCH="x86_64"
+        fi
+    fi
 
     if [ -n "$QEMU_PATH" ]; then
         pvm_probe_qemu "$QEMU_PATH"
     fi
-    pvm_recompute_accel_flags
-}
 
-# pvm_recompute_accel_flags
-# An accelerator is usable only when the host exposes it AND the specific QEMU
-# binary was built with it. HOST_KVM_OK / HOST_HVF_OK hold the host half, which
-# never changes; the binary half does, because switching guest architecture
-# switches binary - qemu-system-x86_64 on Apple Silicon offers tcg only while
-# qemu-system-aarch64 on the same machine offers hvf. Recompute rather than
-# clear, so re-probing a different binary can turn a flag back on.
-pvm_recompute_accel_flags() {
-    KVM_AVAILABLE=0
-    HVF_AVAILABLE=0
-    [ "${HOST_KVM_OK:-0}" -eq 1 ] && pvm_has "$QEMU_ACCELS" kvm && KVM_AVAILABLE=1
-    [ "${HOST_HVF_OK:-0}" -eq 1 ] && pvm_has "$QEMU_ACCELS" hvf && HVF_AVAILABLE=1
-    return 0
+    # 3. Virtualization & Hypervisor support check on Darwin
+    if [ "$HOST_OS" = "Darwin" ]; then
+        # Apple HVF only accelerates guests with matching CPU ISA (arm64 guest on arm64 host, x86_64 on x86_64)
+        if [[ "$HOST_ARCH" == "arm64" && "$TARGET_ARCH" == "aarch64" ]]; then
+            HVF_AVAILABLE=1
+        elif [[ "$HOST_ARCH" == "x86_64" && "$TARGET_ARCH" == "x86_64" ]]; then
+            HVF_AVAILABLE=1
+        else
+            HVF_AVAILABLE=0
+        fi
+    fi
+
+    # 4. Storage / SSD Free Space (in GB)
+    HOST_SSD_FREE_GB=0
+    if [ -d "$root_dir" ]; then
+        local free_kb
+        free_kb=$(df -k "$root_dir" 2>/dev/null | awk 'NR==2 {print $4}')
+        if [ -n "$free_kb" ] && [ "$free_kb" -gt 0 ] 2>/dev/null; then
+            HOST_SSD_FREE_GB=$(( free_kb / 1048576 ))
+        fi
+    fi
 }

@@ -35,7 +35,7 @@ show_host_info() {
     printf "  %-20s : %s\n" "CPU" "$HOST_CPU_NAME"
     printf "  %-20s : %s logical / %s physical\n" "Cores" "$HOST_LOGICAL_CORES" "$HOST_PHYSICAL_CORES"
     printf "  %-20s : %d MB total / %d MB available\n" "RAM" "$HOST_TOTAL_RAM_MB" "$HOST_AVAIL_RAM_MB"
-    printf "  %-20s : %s GB free\n" "VM Storage" "$HOST_SSD_FREE_GB"
+    printf "  %-20s : %d GB free\n" "SSD Storage" "$HOST_SSD_FREE_GB"
 
     local virt_status="Disabled / Unknown"
     local virt_color="$COLOR_YELLOW"
@@ -50,9 +50,11 @@ show_host_info() {
     if [ "$KVM_AVAILABLE" -eq 1 ]; then
         accel_status="KVM available [OK]"; accel_color="$COLOR_GREEN"
     elif [ "$HVF_AVAILABLE" -eq 1 ]; then
-        accel_status="HVF available [OK]"; accel_color="$COLOR_GREEN"
-    else
-        accel_status="None - TCG software emulation only"; accel_color="$COLOR_YELLOW"
+        accel_status="HVF Supported (macOS) [OK]"
+        accel_color="$COLOR_GREEN"
+    elif [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "$TARGET_ARCH" = "x86_64" ]; then
+        accel_status="TCG Emulation (x86_64 guest on Apple Silicon host)"
+        accel_color="$COLOR_YELLOW"
     fi
     printf "  %-20s : " "Hypervisor"
     echo -e "${accel_color}${accel_status}${COLOR_RESET}"
