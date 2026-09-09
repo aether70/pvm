@@ -62,7 +62,9 @@ jobs:
         run: |
           $dest = "$env:RUNNER_TEMP\qemu-extract"
           $exe = Get-ChildItem $dest -Filter "qemu-system-x86_64.exe" -Recurse | Select-Object -First 1
-          $out = & $exe.FullName --version
+          # & returns an ARRAY of lines; -match on an array filters elements and
+          # leaves $Matches null. Join to a single string so the capture works.
+          $out = (& $exe.FullName --version | Out-String)
           if ($out -match 'version ([0-9][0-9.]*)') { $ver = $Matches[1] } else { $ver = "unknown" }
           Write-Host "Windows bundle ships QEMU $ver"
           Set-Content -NoNewline -Path "qemu-windows-x86_64.version" -Value $ver
@@ -480,13 +482,42 @@ jobs:
           echo "all dylibs resolved inside the bundle"
           rm -f outside.txt
 
+          echo "--- the entitlement that gates HVF at runtime ---"
+          # This is the part CI CAN prove on any runner, and it is exactly what
+          # was missing before: without a valid signature carrying
+          # com.apple.security.hypervisor, the kernel refuses the binary access
+          # to Hypervisor.framework no matter what host it lands on.
+          codesign --verify --strict --verbose=2 bundle/qemu-system-aarch64
+          codesign -d --entitlements - bundle/qemu-system-aarch64 2>&1 \
+            | grep -q 'com.apple.security.hypervisor' \
+            || { echo "::error::hypervisor entitlement missing from qemu-system-aarch64"; exit 1; }
+
           echo "--- accelerators ---"
           ./bundle/run-qemu-aarch64.sh -accel help
-          ./bundle/run-qemu-aarch64.sh -accel help | grep -qx hvf
+          ./bundle/run-qemu-aarch64.sh -accel help | grep -qx tcg \
+            || { echo "::error::qemu-system-aarch64 reports no usable accelerator"; exit 1; }
 
-          echo "--- live HVF launch (paused guest, quit over QMP) ---"
+          # GitHub-hosted macOS runners are themselves virtual machines, so
+          # Hypervisor.framework is not available inside them and QEMU omits hvf
+          # from -accel help. That is a property of the runner, not of this
+          # bundle - the same binary reports hvf on real Apple Silicon. Run the
+          # live test wherever it CAN run (self-hosted, local) and say plainly
+          # when it is skipped, rather than asserting something the environment
+          # cannot answer.
+          if ./bundle/run-qemu-aarch64.sh -accel help | grep -qx hvf; then
+            echo "--- live HVF launch (paused guest, quit over QMP) ---"
+            printf '{"execute":"qmp_capabilities"}\n{"execute":"query-status"}\n{"execute":"quit"}\n' \
+              | ./bundle/run-qemu-aarch64.sh -machine virt,accel=hvf -cpu host \
+                  -m 256 -display none -serial none -S -qmp stdio
+            echo "HVF launch verified on this runner"
+          else
+            echo "::notice::hvf absent from -accel help; this runner is a VM without" \
+                 "nested virtualization. Skipping the live hypervisor launch."
+          fi
+
+          echo "--- TCG launch (works on any runner, exercises firmware + argv) ---"
           printf '{"execute":"qmp_capabilities"}\n{"execute":"query-status"}\n{"execute":"quit"}\n' \
-            | ./bundle/run-qemu-aarch64.sh -machine virt,accel=hvf -cpu host \
+            | ./bundle/run-qemu-aarch64.sh -machine virt,accel=tcg -cpu max \
                 -m 256 -display none -serial none -S -qmp stdio
 
           echo "--- x86_64 emulation binary still runs ---"
