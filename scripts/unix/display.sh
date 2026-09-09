@@ -46,15 +46,19 @@ show_host_info() {
     printf "  %-20s : " "Virtualization"
     echo -e "${virt_color}${virt_status}${COLOR_RESET}"
 
-    local accel_status accel_color
+    # Defaults first: under `set -u` an unmatched branch below would abort the
+    # whole launcher on the printf, not just skip a line.
+    local accel_status="TCG software emulation"
+    local accel_color="$COLOR_YELLOW"
     if [ "$KVM_AVAILABLE" -eq 1 ]; then
         accel_status="KVM available [OK]"; accel_color="$COLOR_GREEN"
     elif [ "$HVF_AVAILABLE" -eq 1 ]; then
         accel_status="HVF Supported (macOS) [OK]"
         accel_color="$COLOR_GREEN"
-    elif [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "$TARGET_ARCH" = "x86_64" ]; then
+    elif [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "aarch64" ] && [ "$TARGET_ARCH" = "x86_64" ]; then
         accel_status="TCG Emulation (x86_64 guest on Apple Silicon host)"
-        accel_color="$COLOR_YELLOW"
+    elif [ "$TARGET_ARCH" != "$HOST_ARCH" ]; then
+        accel_status="TCG Emulation ($TARGET_ARCH guest on $HOST_ARCH host)"
     fi
     printf "  %-20s : " "Hypervisor"
     echo -e "${accel_color}${accel_status}${COLOR_RESET}"

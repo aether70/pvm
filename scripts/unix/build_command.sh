@@ -24,11 +24,24 @@ build_qemu_command() {
     # ---- Identity -------------------------------------------------------
     QEMU_ARGS+=("-name" "$DECISION_VM_NAME")
 
-    # 2. Machine and Accelerator
-    local machine_type="q35"
-    if [ "$TARGET_ARCH" = "aarch64" ]; then
-        machine_type="virt"
+    # 1b. Firmware search path
+    # QEMU's compiled-in datadir is <bindir>/../share/qemu, which is where a
+    # Homebrew or distro install keeps its BIOS blobs and option ROMs. The
+    # portable bundle puts them in <bindir>/share instead, so without -L a
+    # bundled QEMU cannot find efi-virtio.rom or its VGA BIOS and refuses to
+    # start. Only passed when that directory really exists, so a system QEMU
+    # keeps using its own datadir.
+    local qemu_share
+    qemu_share="$(dirname "$QEMU_PATH")/share"
+    if [ -d "$qemu_share" ]; then
+        QEMU_ARGS+=("-L" "$qemu_share")
     fi
+
+    # 2. Machine and Accelerator
+    # DECISION_MACHINE / DECISION_CPU come from config.json via decide.sh and
+    # are what the review screen shows the user; recomputing them here from
+    # TARGET_ARCH is how the displayed spec and the launched spec drift apart.
+    local machine_type="${DECISION_MACHINE:-q35}"
 
     if [ "$DECISION_ACCEL" = "tcg" ]; then
         QEMU_ARGS+=("-machine" "${machine_type},accel=tcg")
@@ -37,15 +50,7 @@ build_qemu_command() {
     fi
 
     # 3. CPU model
-    if [ "$DECISION_ACCEL" = "kvm" ] || [ "$DECISION_ACCEL" = "hvf" ]; then
-        QEMU_ARGS+=("-cpu" "host")
-    else
-        if [ "$TARGET_ARCH" = "aarch64" ]; then
-            QEMU_ARGS+=("-cpu" "cortex-a72")
-        else
-            QEMU_ARGS+=("-cpu" "max")
-        fi
-    fi
+    QEMU_ARGS+=("-cpu" "${DECISION_CPU:-max}")
 
     # 4. SMP & Memory
     QEMU_ARGS+=("-smp" "$DECISION_CORES")
