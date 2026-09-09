@@ -19,6 +19,7 @@ parse_vm_conf() {
     OVERRIDE_ARCH=""
     OVERRIDE_GL=""
     OVERRIDE_AUDIO=""
+    OVERRIDE_NESTED=""
 
     [ -f "$conf_file" ] || return 0
 
@@ -48,6 +49,7 @@ parse_vm_conf() {
             arch)      OVERRIDE_ARCH="$val" ;;
             gl)        OVERRIDE_GL="$val" ;;
             audio)     OVERRIDE_AUDIO="$val" ;;
+            nested_virt|nested) OVERRIDE_NESTED="$val" ;;
         esac
     done < "$conf_file"
 }
@@ -230,7 +232,26 @@ run_decision_engine() {
         DECISION_ACCEL_WARN="This QEMU build does not support '$preferred' (offers:$QEMU_ACCELS). Running under $fallback emulation."
     elif [ "$preferred" = "kvm" ] && [ "$KVM_AVAILABLE" -ne 1 ]; then
         if [ "$VIRT_HW_SUPPORT" -ne 1 ]; then
-            DECISION_ACCEL_WARN="CPU virtualization (VT-x/AMD-V) is disabled in firmware. Enable it in BIOS/UEFI to use KVM. Running under $fallback emulation."
+            # The advice has to match the architecture. There is no VT-x, no
+            # AMD-V and no BIOS switch on ARM64: a missing /dev/kvm there means
+            # the kernel is not running at EL2, and when this machine is itself
+            # a guest, the only place that can be fixed is the hypervisor above.
+            case "$HOST_ARCH" in
+                aarch64)
+                    if [ "${HOST_IS_VIRTUAL:-0}" -eq 1 ]; then
+                        DECISION_ACCEL_WARN="No /dev/kvm: this machine is itself a VM (${HOST_VIRT_KIND:-unknown}) and the hypervisor above it did not expose nested virtualization. Start the outer VM with EL2 enabled (QEMU: -machine virt,virtualization=on). Running under $fallback emulation."
+                    else
+                        DECISION_ACCEL_WARN="No /dev/kvm. On ARM64 this means the kernel is not running at EL2 - check that KVM is built in and /dev/kvm is readable/writable by this user. There is no BIOS/UEFI setting for this on ARM64. Running under $fallback emulation."
+                    fi
+                    ;;
+                *)
+                    if [ "${HOST_IS_VIRTUAL:-0}" -eq 1 ]; then
+                        DECISION_ACCEL_WARN="CPU virtualization is not available and this machine is itself a VM (${HOST_VIRT_KIND:-unknown}). Enable nested virtualization on the hypervisor above it. Running under $fallback emulation."
+                    else
+                        DECISION_ACCEL_WARN="CPU virtualization (VT-x/AMD-V) is disabled in firmware. Enable it in BIOS/UEFI to use KVM. Running under $fallback emulation."
+                    fi
+                    ;;
+            esac
         else
             DECISION_ACCEL_WARN="KVM unavailable or /dev/kvm not writable. Running with TCG software emulation."
         fi
@@ -258,6 +279,30 @@ run_decision_engine() {
     else
         DECISION_CPU="$(config_get "$arch_key.cpu_native" "host")"
     fi
+
+    # ---- 6b. Nested virtualization (EL2) --------------------------------
+    # Without this the guest has no EL2, so nothing inside it can run KVM and
+    # the stack dead-ends one layer down. It is opt-in because it is not free:
+    # it needs Apple Silicon M3+ under HVF, and the probe costs a process spawn.
+    DECISION_NESTED="false"
+    DECISION_NESTED_WARN=""
+    local want_nested
+    want_nested="$(pvm_bool "$OVERRIDE_NESTED" "$(config_get "vm_defaults.nested_virt" "false")")"
+    if [ "$want_nested" = "true" ]; then
+        if [ "$DECISION_MACHINE" != "virt" ]; then
+            DECISION_NESTED_WARN="Nested virtualization was requested but machine '$DECISION_MACHINE' has no EL2 property; it is only supported on the aarch64 'virt' machine."
+        elif [ "$DECISION_ACCEL" = "tcg" ]; then
+            # EL2 under TCG works but every instruction is emulated twice over.
+            DECISION_NESTED="true"
+            DECISION_NESTED_WARN="Nested virtualization enabled under TCG. The inner guest will be emulated inside an emulator and will be extremely slow."
+        elif pvm_probe_nested_virt "$QEMU_PATH" "$DECISION_ACCEL" "$DECISION_MACHINE"; then
+            DECISION_NESTED="true"
+        else
+            DECISION_NESTED_WARN="Nested virtualization is not available on this host. On Apple Silicon it requires M3 or newer; M1 and M2 cannot expose EL2. The guest will boot without it and cannot run its own hypervisor."
+        fi
+    fi
+    [ -n "$DECISION_NESTED_WARN" ] && DECISION_WARNINGS+=("$DECISION_NESTED_WARN")
+
 
     # ---- 7. Disk --------------------------------------------------------
     DECISION_DISK=""
@@ -418,6 +463,19 @@ run_decision_engine() {
     if [ "$uefi_required" = "true" ] && [ "$DECISION_UEFI" != "true" ]; then
         DECISION_UEFI="true"
         DECISION_WARNINGS+=("Architecture '$DECISION_ARCH' has no legacy BIOS; UEFI has been force-enabled.")
+    fi
+
+    # Measured on Apple Silicon with the edk2-stable202408 images that ship in
+    # the bundle: with EL2 enabled the firmware fails its DXE image loads
+    # ("Image at ... start failed") and never reaches a bootloader, while the
+    # same image boots normally with EL2 off. A direct kernel boot at EL2 works
+    # and does bring up /dev/kvm in the guest, so this is a firmware limit, not
+    # a hypervisor one. Warn rather than refuse - a newer firmware dropped into
+    # share/ may well fix it, and we should not hard-block on our own bundle.
+    if [ "$DECISION_NESTED" = "true" ] && [ "$DECISION_UEFI" = "true" ]; then
+        # aarch64/virt has no legacy BIOS, so "turn UEFI off" is not advice we
+        # can give here - section 12 force-enables it regardless.
+        DECISION_WARNINGS+=("Nested virtualization with UEFI: the bundled edk2 firmware does not complete its boot when EL2 is enabled, and this VM will most likely hang at firmware. Boot it with a direct kernel instead (-kernel/-initrd), or replace share/edk2-aarch64-code.fd with a newer edk2 build. Guest-side KVM is confirmed working at EL2 via direct kernel boot.")
     fi
 
     DECISION_UEFI_CODE=""

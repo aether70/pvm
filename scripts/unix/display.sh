@@ -35,7 +35,17 @@ show_host_info() {
     printf "  %-20s : %s\n" "CPU" "$HOST_CPU_NAME"
     printf "  %-20s : %s logical / %s physical\n" "Cores" "$HOST_LOGICAL_CORES" "$HOST_PHYSICAL_CORES"
     printf "  %-20s : %d MB total / %d MB available\n" "RAM" "$HOST_TOTAL_RAM_MB" "$HOST_AVAIL_RAM_MB"
-    printf "  %-20s : %d GB free\n" "SSD Storage" "$HOST_SSD_FREE_GB"
+    # df inside a guest measures the VIRTUAL disk. A sparse image can present
+    # terabytes while its backing store holds kilobytes, so this number must
+    # not be read as "bytes the hardware can actually absorb".
+    if [ "${HOST_IS_VIRTUAL:-0}" -eq 1 ]; then
+        printf "  %-20s : " "SSD Storage"
+        echo -e "${COLOR_YELLOW}${HOST_SSD_FREE_GB} GB free (virtual disk - guest view, not backing store)${COLOR_RESET}"
+        printf "  %-20s : " "Platform"
+        echo -e "${COLOR_YELLOW}running inside a VM (${HOST_VIRT_KIND:-unknown})${COLOR_RESET}"
+    else
+        printf "  %-20s : %d GB free\n" "SSD Storage" "$HOST_SSD_FREE_GB"
+    fi
 
     local virt_status="Disabled / Unknown"
     local virt_color="$COLOR_YELLOW"
