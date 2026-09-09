@@ -777,7 +777,7 @@ function Show-Step5 {
     $contentPanel.Controls.Add($lblTag)
 
     $txtTag = New-Object System.Windows.Forms.TextBox
-    $txtTag.Text = "qemu-v9.2.0"
+    $txtTag.Text = "qemu-engines-v1.0.0"
     $txtTag.Location = New-Object System.Drawing.Point(150, 132)
     $txtTag.Size = New-Object System.Drawing.Size(150, 20)
     $contentPanel.Controls.Add($txtTag)
