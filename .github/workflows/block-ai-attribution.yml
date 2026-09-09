@@ -1,0 +1,34 @@
+name: Enforce Clean Commit Authorship
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  check-authorship:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for disallowed AI commit trailers
+        run: |
+          echo "Scanning recent commits for unauthorized AI co-author trailers..."
+          # If pull request, check commits between base and head; if push, check last 10 commits
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            RANGE="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          else
+            RANGE="HEAD~10..HEAD"
+          fi
+
+          VIOLATIONS=$(git log "$RANGE" --grep="[Cc]o-[Aa]uthored-[Bb]y:.*[Cc]laude" --grep="anthropic\.com" -i --oneline || true)
+          if [ -n "$VIOLATIONS" ]; then
+            echo "::error::Commit message contains disallowed AI attribution:"
+            echo "$VIOLATIONS"
+            exit 1
+          fi
+          echo "All checked commits have valid human authorship."

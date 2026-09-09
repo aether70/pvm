@@ -1,0 +1,13 @@
+#!/bin/sh
+# Git commit-msg hook to strip any Claude / Anthropic / AI co-authorship attribution
+COMMIT_MSG_FILE="$1"
+
+if [ -f "$COMMIT_MSG_FILE" ]; then
+    # Strip any lines containing Claude or Anthropic co-authorship trailers
+    sed -i.bak -E \
+        -e '/^[[:space:]]*[Cc]o-[Aa]uthored-[Bb]y:[[:space:]]*.*[Cc]laude/d' \
+        -e '/^[[:space:]]*[Cc]o-[Aa]uthored-[Bb]y:[[:space:]]*.*anthropic\.com/d' \
+        "$COMMIT_MSG_FILE"
+    rm -f "${COMMIT_MSG_FILE}.bak"
+fi
+exit 0
