@@ -12,6 +12,7 @@
     "network": "nat",
     "ssh_port": 2222,
     "uefi": true,
+    "nested_virt": false,
     "arch": "x86_64",
     "disk_cache": "auto",
     "gl": "auto",

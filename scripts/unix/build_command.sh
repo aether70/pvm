@@ -43,10 +43,15 @@ build_qemu_command() {
     # TARGET_ARCH is how the displayed spec and the launched spec drift apart.
     local machine_type="${DECISION_MACHINE:-q35}"
 
+    # EL2 for the guest. decide.sh has already probed that this host can
+    # actually provide it, so reaching here means it works.
+    local machine_opts=""
+    [ "${DECISION_NESTED:-false}" = "true" ] && machine_opts=",virtualization=on"
+
     if [ "$DECISION_ACCEL" = "tcg" ]; then
-        QEMU_ARGS+=("-machine" "${machine_type},accel=tcg")
+        QEMU_ARGS+=("-machine" "${machine_type},accel=tcg${machine_opts}")
     else
-        QEMU_ARGS+=("-machine" "${machine_type},accel=$DECISION_ACCEL")
+        QEMU_ARGS+=("-machine" "${machine_type},accel=${DECISION_ACCEL}${machine_opts}")
     fi
 
     # 3. CPU model

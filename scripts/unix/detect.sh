@@ -182,6 +182,113 @@ pvm_recompute_accel_flags() {
     esac
 }
 
+# pvm_probe_nested_virt <qemu_path> <accel> <machine>
+# Can this host expose EL2 (aarch64) to its guest, so that guest can itself run
+# a hypervisor? There is no sysctl or cpuinfo bit that answers this - Apple
+# gates it on M3+ at the Hypervisor.framework level, and QEMU only finds out by
+# asking. So ask: start the machine paused and quit immediately. ~200ms, and it
+# only runs when a VM has actually requested nested virtualization.
+pvm_probe_nested_virt() {
+    local qemu="$1" accel="$2" machine="${3:-virt}"
+    [ -x "$qemu" ] || return 1
+
+    # -cpu host is only valid under a hypervisor; TCG needs a named model.
+    local cpu="host"
+    [ "$accel" = "tcg" ] && cpu="max"
+
+    # -nic none matters: the default virt NIC pulls in efi-virtio.rom, and a
+    # missing option ROM would fail this probe for a reason that has nothing
+    # to do with EL2.
+    printf '{"execute":"qmp_capabilities"}\n{"execute":"quit"}\n' \
+        | "$qemu" -machine "${machine},accel=${accel},virtualization=on" \
+            -cpu "$cpu" -m 128 -nic none -display none -serial none \
+            -S -qmp stdio >/dev/null 2>&1
+}
+
+# pvm_detect_virtual_host
+# Sets HOST_IS_VIRTUAL (0/1) and HOST_VIRT_KIND. This is what tells the rest of
+# the launcher that "free space" and "hypervisor available" mean something
+# different from what they mean on bare metal: df inside a guest reports the
+# VIRTUAL disk, which on a sparse image can be orders of magnitude larger than
+# the backing store that actually has to hold the bytes.
+pvm_detect_virtual_host() {
+    HOST_IS_VIRTUAL=0
+    HOST_VIRT_KIND="none"
+
+    case "$(uname -s)" in
+        Linux)
+            if command -v systemd-detect-virt >/dev/null 2>&1; then
+                local d
+                d="$(systemd-detect-virt 2>/dev/null)"
+                if [ -n "$d" ] && [ "$d" != "none" ]; then
+                    HOST_IS_VIRTUAL=1; HOST_VIRT_KIND="$d"; return 0
+                fi
+            fi
+            # DMI is absent on the aarch64 "virt" machine, which identifies
+            # itself through the device tree instead.
+            local dmi
+            for dmi in /sys/class/dmi/id/product_name /sys/class/dmi/id/sys_vendor; do
+                [ -r "$dmi" ] || continue
+                case "$(cat "$dmi" 2>/dev/null)" in
+                    *QEMU*|*KVM*|*VMware*|*VirtualBox*|*Xen*|*Hyper-V*|*Parallels*)
+                        HOST_IS_VIRTUAL=1; HOST_VIRT_KIND="qemu/other"; return 0 ;;
+                esac
+            done
+            local dt
+            for dt in /proc/device-tree/compatible /sys/firmware/devicetree/base/compatible; do
+                [ -r "$dt" ] || continue
+                if tr -d '\0' < "$dt" 2>/dev/null | grep -qi 'dummy-virt\|qemu'; then
+                    HOST_IS_VIRTUAL=1; HOST_VIRT_KIND="qemu"; return 0
+                fi
+            done
+            ;;
+        Darwin)
+            # 1 when macOS itself is running as a guest.
+            if [ "$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)" = "1" ]; then
+                HOST_IS_VIRTUAL=1; HOST_VIRT_KIND="apple-hv-guest"
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# pvm_linux_cpu_name - /proc/cpuinfo has no "model name" on ARM64
+pvm_linux_cpu_name() {
+    local name
+    name="$(awk -F: '/model name/ { sub(/^[ \t]+/, "", $2); print $2; exit }' /proc/cpuinfo 2>/dev/null)"
+    [ -n "$name" ] || \
+        name="$(awk -F: '/^Model name/ { sub(/^[ \t]+/, "", $2); print $2; exit }' <(lscpu 2>/dev/null) 2>/dev/null)"
+    # Single-board machines name themselves in the device tree.
+    if [ -z "$name" ]; then
+        local m
+        for m in /proc/device-tree/model /sys/firmware/devicetree/base/model; do
+            [ -r "$m" ] || continue
+            name="$(tr -d '\0' < "$m" 2>/dev/null)"
+            [ -n "$name" ] && break
+        done
+    fi
+    # Last resort on ARM64: the implementer/part pair that IS always present.
+    if [ -z "$name" ]; then
+        local impl part
+        impl="$(awk -F': ' '/^CPU implementer/ { print $2; exit }' /proc/cpuinfo 2>/dev/null)"
+        part="$(awk -F': ' '/^CPU part/ { print $2; exit }' /proc/cpuinfo 2>/dev/null)"
+        if [ -n "$impl" ] && [ -n "$part" ]; then
+            case "$impl" in
+                0x41) name="ARM" ;;
+                0x42) name="Broadcom" ;;
+                0x43) name="Cavium" ;;
+                0x4e) name="NVIDIA" ;;
+                0x50) name="Ampere" ;;
+                0x51) name="Qualcomm" ;;
+                0xc0) name="Ampere" ;;
+                *)    name="ARM64" ;;
+            esac
+            name="$name CPU (part $part)"
+        fi
+    fi
+    printf '%s' "$name"
+}
+
 detect_host_info() {
     local root_dir="$1"
     local guest_arch="${2:-}"
@@ -196,6 +303,8 @@ detect_host_info() {
     HOST_AVAIL_RAM_MB=1024
     HOST_SSD_FREE_GB=0
     VIRT_HW_SUPPORT=0
+    HOST_IS_VIRTUAL=0
+    HOST_VIRT_KIND="none"
     HOST_KVM_OK=0
     HOST_HVF_OK=0
     KVM_AVAILABLE=0
@@ -210,11 +319,13 @@ detect_host_info() {
     QEMU_DEVICES=" "
     QEMU_SHARE_DIRS=""
 
+    pvm_detect_virtual_host
+
     if [ "$HOST_OS" = "Linux" ]; then
         HOST_LOGICAL_CORES="$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)"
         HOST_PHYSICAL_CORES="$(awk -F: '/^core id/ { print $2 }' /proc/cpuinfo 2>/dev/null | sort -u | wc -l | tr -d ' ')"
         [ "${HOST_PHYSICAL_CORES:-0}" -ge 1 ] 2>/dev/null || HOST_PHYSICAL_CORES="$HOST_LOGICAL_CORES"
-        HOST_CPU_NAME="$(awk -F: '/model name/ { sub(/^[ \t]+/, "", $2); print $2; exit }' /proc/cpuinfo 2>/dev/null)"
+        HOST_CPU_NAME="$(pvm_linux_cpu_name)"
         [ -n "$HOST_CPU_NAME" ] || HOST_CPU_NAME="Linux CPU"
 
         if [ -r /proc/meminfo ]; then
@@ -225,7 +336,22 @@ detect_host_info() {
                 HOST_AVAIL_RAM_MB="$(awk '/^MemFree:/ { print int($2 / 1024); exit }' /proc/meminfo)"
         fi
 
-        grep -qE '^flags.*(vmx|svm)' /proc/cpuinfo 2>/dev/null && VIRT_HW_SUPPORT=1
+        # x86 advertises the hypervisor extension as a cpuinfo flag. ARM64 does
+        # not: there is no vmx/svm equivalent, EL2 is not listed in Features,
+        # and the kernel consumes EL2 itself to implement KVM. /dev/kvm
+        # existing IS the capability signal there - grepping for vmx on ARM64
+        # reports "virtualization disabled" on a machine where KVM works fine.
+        case "$HOST_ARCH" in
+            x86_64|i386)
+                grep -qE '^flags.*(vmx|svm)' /proc/cpuinfo 2>/dev/null && VIRT_HW_SUPPORT=1
+                ;;
+            aarch64)
+                [ -e /dev/kvm ] && VIRT_HW_SUPPORT=1
+                ;;
+            *)
+                [ -e /dev/kvm ] && VIRT_HW_SUPPORT=1
+                ;;
+        esac
         # /dev/kvm existing is not enough - QEMU needs it open for read/write.
         if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
             HOST_KVM_OK=1
