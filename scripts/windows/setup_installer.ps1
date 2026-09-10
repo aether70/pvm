@@ -21,6 +21,39 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+# ---- Splash Screen --------------------------------------------------------
+$splashForm = New-Object System.Windows.Forms.Form
+$splashForm.StartPosition = "CenterScreen"
+$splashForm.Size = New-Object System.Drawing.Size(250, 250)
+$splashForm.FormBorderStyle = "None"
+$splashForm.BackColor = [System.Drawing.Color]::FromArgb(15, 23, 42)
+$splashForm.ShowInTaskbar = $false
+$splashForm.TopMost = $true
+
+$splashLogo = New-Object System.Windows.Forms.PictureBox
+$splashLogo.Size = New-Object System.Drawing.Size(120, 120)
+$splashLogo.Location = New-Object System.Drawing.Point(65, 40)
+$splashLogo.SizeMode = "Zoom"
+$logoPath = Join-Path $SourceRoot "logo\portable_vm_logo.png"
+if (Test-Path $logoPath) {
+    try { $splashLogo.Image = [System.Drawing.Image]::FromFile($logoPath) } catch {}
+}
+$splashForm.Controls.Add($splashLogo)
+
+$splashLabel = New-Object System.Windows.Forms.Label
+$splashLabel.Text = "Loading Installer..."
+$splashLabel.ForeColor = [System.Drawing.Color]::White
+$splashLabel.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+$splashLabel.TextAlign = "MiddleCenter"
+$splashLabel.AutoSize = $false
+$splashLabel.Size = New-Object System.Drawing.Size(250, 30)
+$splashLabel.Location = New-Object System.Drawing.Point(0, 170)
+$splashForm.Controls.Add($splashLabel)
+
+$splashForm.Show()
+[System.Windows.Forms.Application]::DoEvents()
+# -------------------------------------------------------------------------
+
 # ─────────────────────────────────────────────
 # GLOBAL CONSTANTS
 # ─────────────────────────────────────────────
@@ -876,6 +909,7 @@ function Show-Step5 {
                 
                 # Download
                 Invoke-WebRequest -Uri $url -OutFile $tempZip -UseBasicParsing
+                Unblock-File -Path $tempZip -ErrorAction SilentlyContinue
                 
                 $destDir = Join-Path $state.InstallPath $engine.Dir
                 if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
@@ -906,6 +940,7 @@ function Show-Step5 {
                 }
                 $zip.Dispose()
                 Remove-Item $tempZip -Force
+                Get-ChildItem -Path $destDir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue
             }
             
             $state.QemuInstalled = $true
@@ -1122,4 +1157,8 @@ $btnBack.add_Click({
     }
 })
 
+if ($splashForm) {
+    $splashForm.Close()
+    $splashForm.Dispose()
+}
 [void]$form.ShowDialog()

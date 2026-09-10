@@ -31,6 +31,39 @@ Add-Type -AssemblyName System.Drawing
 # Enable Visual Styles
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+# ---- Splash Screen --------------------------------------------------------
+$splashForm = New-Object System.Windows.Forms.Form
+$splashForm.StartPosition = "CenterScreen"
+$splashForm.Size = New-Object System.Drawing.Size(250, 250)
+$splashForm.FormBorderStyle = "None"
+$splashForm.BackColor = [System.Drawing.Color]::FromArgb(15, 23, 42)
+$splashForm.ShowInTaskbar = $false
+$splashForm.TopMost = $true
+
+$splashLogo = New-Object System.Windows.Forms.PictureBox
+$splashLogo.Size = New-Object System.Drawing.Size(120, 120)
+$splashLogo.Location = New-Object System.Drawing.Point(65, 40)
+$splashLogo.SizeMode = "Zoom"
+$logoPath = Join-Path $RootDir "logo\portable_vm_logo.png"
+if (Test-Path $logoPath) {
+    try { $splashLogo.Image = [System.Drawing.Image]::FromFile($logoPath) } catch {}
+}
+$splashForm.Controls.Add($splashLogo)
+
+$splashLabel = New-Object System.Windows.Forms.Label
+$splashLabel.Text = "Loading PortableVM..."
+$splashLabel.ForeColor = [System.Drawing.Color]::White
+$splashLabel.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+$splashLabel.TextAlign = "MiddleCenter"
+$splashLabel.AutoSize = $false
+$splashLabel.Size = New-Object System.Drawing.Size(250, 30)
+$splashLabel.Location = New-Object System.Drawing.Point(0, 170)
+$splashForm.Controls.Add($splashLabel)
+
+$splashForm.Show()
+[System.Windows.Forms.Application]::DoEvents()
+# -------------------------------------------------------------------------
+
 # 1. Gather Host Details
 $hostInfo = Get-HostInformation -RootDir $RootDir
 
@@ -622,4 +655,8 @@ $form.add_FormClosing({
 })
 
 # Show Form
+if ($splashForm) {
+    $splashForm.Close()
+    $splashForm.Dispose()
+}
 [void]$form.ShowDialog()
