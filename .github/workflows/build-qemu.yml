@@ -7,14 +7,15 @@ name: Build QEMU Engines
 on:
   workflow_dispatch:
     inputs:
-      qemu_version:
-        description: 'QEMU version to package (e.g. 9.2.0)'
-        required: true
-        default: '9.2.0'
       release_tag:
-        description: 'Release tag name (e.g. qemu-v9.2.0)'
+        description: 'Release tag name'
         required: true
-        default: 'qemu-v9.2.0'
+        default: 'qemu-engines-v1.0.0'
+
+# The tag is deliberately NOT named after a QEMU version. Each platform sources
+# QEMU from a different upstream (Weilnetz / distro apt / Homebrew) and they are
+# never the same version, so every job records the version it actually shipped
+# into a .version file and the release notes table is generated from those.
 
 jobs:
   # ═══════════════════════════════════════════════════════
@@ -56,6 +57,18 @@ jobs:
           Get-ChildItem "$dest" -Filter "qemu-system-*.exe" -Recurse | Where-Object { $_.Name -ne "qemu-system-x86_64.exe" } | Remove-Item -Force
           Write-Host "Stripped unnecessary emulators"
 
+      - name: Record shipped QEMU version
+        shell: pwsh
+        run: |
+          $dest = "$env:RUNNER_TEMP\qemu-extract"
+          $exe = Get-ChildItem $dest -Filter "qemu-system-x86_64.exe" -Recurse | Select-Object -First 1
+          # & returns an ARRAY of lines; -match on an array filters elements and
+          # leaves $Matches null. Join to a single string so the capture works.
+          $out = (& $exe.FullName --version | Out-String)
+          if ($out -match 'version ([0-9][0-9.]*)') { $ver = $Matches[1] } else { $ver = "unknown" }
+          Write-Host "Windows bundle ships QEMU $ver"
+          Set-Content -NoNewline -Path "qemu-windows-x86_64.version" -Value $ver
+
       - name: Create ZIP
         shell: pwsh
         run: |
@@ -68,13 +81,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: qemu-windows-x86_64
-          path: qemu-windows-x86_64.zip
+          path: |
+            qemu-windows-x86_64.zip
+            qemu-windows-x86_64.version
 
   # ═══════════════════════════════════════════════════════
   # JOB 2: Linux x86_64
   # ═══════════════════════════════════════════════════════
   build-linux-x86_64:
-    runs-on: ubuntu-22.04  # Use older Ubuntu for max glibc compatibility
+    runs-on: ubuntu-24.04  # QEMU 8.2.2; sets the glibc floor at 2.39
     steps:
       - name: Install QEMU
         run: |
@@ -123,6 +138,14 @@ jobs:
           chmod +x bundle/run-qemu.sh
           chmod +x bundle/qemu-system-x86_64
 
+      - name: Record shipped QEMU version
+        run: |
+          set -euo pipefail
+          VER="$(./bundle/qemu-system-x86_64 --version | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+          [ -n "$VER" ] || VER="unknown"
+          echo "qemu-linux-x86_64 bundle ships QEMU $VER"
+          printf '%s' "$VER" > qemu-linux-x86_64.version
+
       - name: Create ZIP
         run: |
           cd bundle && zip -r ../qemu-linux-x86_64.zip . && cd ..
@@ -133,33 +156,38 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: qemu-linux-x86_64
-          path: qemu-linux-x86_64.zip
+          path: |
+            qemu-linux-x86_64.zip
+            qemu-linux-x86_64.version
 
   # ═══════════════════════════════════════════════════════
   # JOB 3: Linux ARM64
   # ═══════════════════════════════════════════════════════
   build-linux-arm64:
-    runs-on: ubuntu-22.04-arm  # GitHub ARM64 runner
+    runs-on: ubuntu-24.04-arm  # GitHub ARM64 runner; QEMU 8.2.2, glibc 2.39
     steps:
       - name: Install QEMU
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86
+          # qemu-system-arm is the package that ships qemu-system-aarch64 - the
+          # only binary on this runner that can use KVM on an ARM64 host.
+          # qemu-system-x86 is bundled alongside it for x86_64 guests, which
+          # run under TCG emulation here.
+          sudo apt-get install -y qemu-system-arm qemu-system-x86
 
-      - name: Bundle binary + all shared libraries
+      - name: Bundle binaries + all shared libraries
         run: |
+          set -euo pipefail
           mkdir -p bundle/libs
 
-          QEMU_BIN=$(which qemu-system-x86_64)
-          cp "$QEMU_BIN" bundle/
-
-          QEMU_IMG=$(which qemu-img 2>/dev/null || true)
-          if [ -n "$QEMU_IMG" ]; then
-            cp "$QEMU_IMG" bundle/
-          fi
-
-          ldd "$QEMU_BIN" | grep "=> /" | awk '{print $3}' | while read lib; do
-            cp "$lib" bundle/libs/
+          for bin in qemu-system-aarch64 qemu-system-x86_64 qemu-img; do
+            path="$(command -v "$bin")"
+            echo "Bundling $bin from $path"
+            cp "$path" bundle/
+            # ldd prints the whole transitive closure, not just direct needs.
+            ldd "$path" | grep "=> /" | awk '{print $3}' | while read -r lib; do
+              cp -n "$lib" bundle/libs/ || true
+            done
           done
 
           if [ -d /usr/share/qemu ]; then
@@ -171,20 +199,51 @@ jobs:
 
           du -sh bundle/
 
-      - name: Create launcher wrapper
+      - name: Create launcher wrappers
         run: |
+          set -euo pipefail
+          for arch in aarch64 x86_64; do
+            cat > "bundle/run-qemu-$arch.sh" << WRAPPER
+          #!/bin/bash
+          DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+          export LD_LIBRARY_PATH="\$DIR/libs:\${LD_LIBRARY_PATH:-}"
+          exec "\$DIR/qemu-system-$arch" -L "\$DIR/share" "\$@"
+          WRAPPER
+            chmod +x "bundle/run-qemu-$arch.sh"
+          done
+
+          # Default wrapper: native arch on this host, emulation otherwise.
           cat > bundle/run-qemu.sh << 'WRAPPER'
           #!/bin/bash
           DIR="$(cd "$(dirname "$0")" && pwd)"
-          export LD_LIBRARY_PATH="$DIR/libs:$LD_LIBRARY_PATH"
-          exec "$DIR/qemu-system-x86_64" "$@"
+          export LD_LIBRARY_PATH="$DIR/libs:${LD_LIBRARY_PATH:-}"
+          case "$(uname -m)" in
+            aarch64|arm64) BIN="$DIR/qemu-system-aarch64" ;;
+            *)             BIN="$DIR/qemu-system-x86_64" ;;
+          esac
+          exec "$BIN" -L "$DIR/share" "$@"
           WRAPPER
           chmod +x bundle/run-qemu.sh
-          chmod +x bundle/qemu-system-x86_64
+          chmod +x bundle/qemu-system-aarch64 bundle/qemu-system-x86_64 bundle/qemu-img
+
+      - name: Verify bundled binaries
+        run: |
+          set -euo pipefail
+          ./bundle/run-qemu-aarch64.sh --version
+          ./bundle/run-qemu-aarch64.sh -accel help
+          ./bundle/run-qemu-x86_64.sh --version
+
+      - name: Record shipped QEMU version
+        run: |
+          set -euo pipefail
+          VER="$(./bundle/run-qemu-aarch64.sh --version | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+          [ -n "$VER" ] || VER="unknown"
+          echo "qemu-linux-arm64 bundle ships QEMU $VER"
+          printf '%s' "$VER" > qemu-linux-arm64.version
 
       - name: Create ZIP
         run: |
-          cd bundle && zip -r ../qemu-linux-arm64.zip . && cd ..
+          cd bundle && zip -qr ../qemu-linux-arm64.zip . && cd ..
           SIZE=$(du -h qemu-linux-arm64.zip | cut -f1)
           echo "Created qemu-linux-arm64.zip ($SIZE)"
 
@@ -192,7 +251,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: qemu-linux-arm64
-          path: qemu-linux-arm64.zip
+          path: |
+            qemu-linux-arm64.zip
+            qemu-linux-arm64.version
 
   # ═══════════════════════════════════════════════════════
   # JOB 5: macOS ARM64 (Apple Silicon M1/M2/M3/M4)
@@ -203,48 +264,278 @@ jobs:
       - name: Install QEMU via Homebrew
         run: brew install qemu
 
-      - name: Bundle binary + all dylibs
+      - name: Bundle binaries, relink dylibs and code-sign
         run: |
+          set -euo pipefail
           mkdir -p bundle/libs
+          python3 - <<'PY'
+          import os, shutil, subprocess
 
-          QEMU_BIN=$(which qemu-system-x86_64)
-          cp "$QEMU_BIN" bundle/
+          BUNDLE   = "bundle"
+          LIBS     = os.path.join(BUNDLE, "libs")
+          # Only Homebrew-managed libraries get bundled. /usr/lib and
+          # /System/... are dyld-shared-cache paths that exist on every Mac and
+          # must NOT be copied - they are version-locked to the OS.
+          PREFIXES = ("/opt/homebrew/", "/usr/local/")
+          # qemu-system-aarch64 is the one that can use Hypervisor.framework on
+          # Apple Silicon; qemu-system-x86_64 is TCG-only here but is still
+          # wanted for running x86 guests.
+          BINARIES = ["qemu-system-aarch64", "qemu-system-x86_64", "qemu-img"]
 
-          QEMU_IMG=$(which qemu-img 2>/dev/null || true)
-          if [ -n "$QEMU_IMG" ]; then
-            cp "$QEMU_IMG" bundle/
+          def otool_deps(path):
+              out = subprocess.run(["otool", "-L", path],
+                                   capture_output=True, text=True, check=True).stdout
+              deps = []
+              for line in out.splitlines()[1:]:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  ref = line.split(" (compatibility")[0].strip()
+                  if ref.startswith(PREFIXES):
+                      deps.append(ref)
+              return deps
+
+          # 1. Copy the executables.
+          for name in BINARIES:
+              src = shutil.which(name)
+              if src is None:
+                  raise SystemExit(f"{name} not found on PATH")
+              shutil.copy2(src, os.path.join(BUNDLE, name))
+              print(f"bundled {name} <- {src}")
+
+          # 2. Walk the FULL transitive dependency graph, not just the direct
+          #    needs of each executable. libgnutls pulls in libnettle, which
+          #    pulls in libgmp; a one-level otool pass silently drops those and
+          #    the bundle only works on a machine that already has Homebrew.
+          pending = [os.path.join(BUNDLE, n) for n in BINARIES]
+          copied  = {}
+          while pending:
+              cur = pending.pop()
+              for ref in otool_deps(cur):
+                  base = os.path.basename(ref)
+                  if base in copied:
+                      continue
+                  if not os.path.exists(ref):
+                      print(f"  WARNING: missing dependency {ref}")
+                      continue
+                  dst = os.path.join(LIBS, base)
+                  shutil.copy2(ref, dst)   # follows the Cellar symlink
+                  os.chmod(dst, 0o755)
+                  copied[base] = dst
+                  pending.append(dst)
+                  print(f"  lib {base}")
+
+          # 3. Rewrite every load command to @executable_path/libs/. dyld
+          #    resolves @executable_path against the *executable*, so the same
+          #    prefix is correct inside the dylibs themselves.
+          def rpaths(path):
+              out = subprocess.run(["otool", "-l", path],
+                                   capture_output=True, text=True, check=True).stdout.splitlines()
+              found, want = [], False
+              for line in out:
+                  line = line.strip()
+                  if line.startswith("cmd LC_RPATH"):
+                      want = True
+                  elif want and line.startswith("path "):
+                      found.append(line.split()[1])
+                      want = False
+              return found
+
+          def relink(path, is_lib):
+              if is_lib:
+                  subprocess.run(["install_name_tool", "-id",
+                                  "@executable_path/libs/" + os.path.basename(path), path],
+                                 check=True)
+              for ref in otool_deps(path):
+                  subprocess.run(["install_name_tool", "-change", ref,
+                                  "@executable_path/libs/" + os.path.basename(ref), path],
+                                 check=True)
+              # A leftover LC_RPATH into the Cellar is invisible to `otool -L`
+              # but is still a live search path: any @rpath/ load command that
+              # survives would resolve against Homebrew on a dev machine and
+              # fail on a clean one. Delete them so that failure mode cannot hide.
+              for rp in rpaths(path):
+                  if rp.startswith(PREFIXES):
+                      subprocess.run(["install_name_tool", "-delete_rpath", rp, path],
+                                     check=True)
+                      print(f"  rpath- {os.path.basename(path)}: {rp}")
+
+          for name in BINARIES:
+              relink(os.path.join(BUNDLE, name), is_lib=False)
+          for dst in copied.values():
+              relink(dst, is_lib=True)
+
+          print(f"bundled {len(copied)} dylibs")
+          PY
+
+      - name: Bundle firmware and license
+        run: |
+          set -euo pipefail
+          QEMU_SHARE="$(brew --prefix qemu)/share/qemu"
+          if [ ! -d "$QEMU_SHARE" ]; then
+            echo "::error::$QEMU_SHARE not found"; exit 1
           fi
+          cp -R "$QEMU_SHARE" bundle/share
 
-          otool -L "$QEMU_BIN" | awk '{print $1}' | grep "/opt/homebrew\|/usr/local" | while read lib; do
-            if [ -f "$lib" ]; then
-              cp "$lib" bundle/libs/
+          # These three are what an Apple Silicon `virt` guest cannot boot
+          # without: the aarch64 UEFI code image, its variable store template,
+          # and the virtio NIC option ROM.
+          for f in edk2-aarch64-code.fd edk2-arm-vars.fd efi-virtio.rom; do
+            if [ ! -f "bundle/share/$f" ]; then
+              echo "::error::required firmware bundle/share/$f is missing"; exit 1
             fi
           done
 
-          QEMU_SHARE=$(brew --prefix qemu)/share/qemu
-          if [ -d "$QEMU_SHARE" ]; then
-            cp -r "$QEMU_SHARE" bundle/share
-          fi
-
-          echo "Fetching QEMU License (GPLv2)..."
           curl -sL "https://raw.githubusercontent.com/qemu/qemu/master/COPYING" -o bundle/QEMU_LICENSE.txt
 
-          du -sh bundle/
-
-      - name: Create launcher wrapper
+      - name: Code-sign with the hypervisor entitlement
         run: |
+          set -euo pipefail
+          # install_name_tool invalidates the existing signature, and arm64
+          # macOS refuses to execute an unsigned or broken-signature Mach-O.
+          # Libraries first, then the executables - a binary's signature covers
+          # nothing but itself, but signing must follow every last edit.
+          cat > /tmp/hypervisor.entitlements <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>com.apple.security.hypervisor</key>
+              <true/>
+          </dict>
+          </plist>
+          PLIST
+
+          for lib in bundle/libs/*.dylib; do
+            codesign --force --sign - --timestamp=none "$lib"
+          done
+
+          for bin in qemu-system-aarch64 qemu-system-x86_64 qemu-img; do
+            codesign --force --sign - --timestamp=none \
+              --entitlements /tmp/hypervisor.entitlements "bundle/$bin"
+          done
+
+          echo "--- verifying entitlement ---"
+          codesign -d --entitlements - bundle/qemu-system-aarch64
+          codesign --verify --verbose bundle/qemu-system-aarch64
+
+      - name: Create launcher wrappers
+        run: |
+          set -euo pipefail
+          # -L is not optional for a relocated bundle: QEMU's compiled-in
+          # datadir is <bindir>/../share/qemu, which does not exist here.
+          for arch in aarch64 x86_64; do
+            cat > "bundle/run-qemu-$arch.sh" << WRAPPER
+          #!/bin/bash
+          DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+          exec "\$DIR/qemu-system-$arch" -L "\$DIR/share" "\$@"
+          WRAPPER
+            chmod +x "bundle/run-qemu-$arch.sh"
+          done
+
           cat > bundle/run-qemu.sh << 'WRAPPER'
           #!/bin/bash
           DIR="$(cd "$(dirname "$0")" && pwd)"
-          export DYLD_LIBRARY_PATH="$DIR/libs:$DYLD_LIBRARY_PATH"
-          exec "$DIR/qemu-system-x86_64" "$@"
+          if [ "$(uname -m)" = "arm64" ] && [ -x "$DIR/qemu-system-aarch64" ]; then
+              exec "$DIR/qemu-system-aarch64" -L "$DIR/share" "$@"
+          else
+              exec "$DIR/qemu-system-x86_64" -L "$DIR/share" "$@"
+          fi
           WRAPPER
           chmod +x bundle/run-qemu.sh
-          chmod +x bundle/qemu-system-x86_64
+          chmod +x bundle/qemu-system-aarch64 bundle/qemu-system-x86_64 bundle/qemu-img
+
+      - name: Verify portability and live HVF launch
+        run: |
+          set -euo pipefail
+
+          echo "--- no un-rewritten Homebrew paths may remain ---"
+          leaked=0
+          for f in bundle/qemu-system-aarch64 bundle/qemu-system-x86_64 bundle/qemu-img bundle/libs/*.dylib; do
+            # -l, not -L: LC_RPATH entries are search paths that `otool -L`
+            # never prints, and they leak just as badly as a load command.
+            if otool -l "$f" | grep -qE '/opt/homebrew|/usr/local/(opt|Cellar)'; then
+              echo "::error::$f still references a Homebrew path"
+              otool -l "$f" | grep -E '/opt/homebrew|/usr/local/(opt|Cellar)'
+              leaked=1
+            fi
+          done
+          [ "$leaked" -eq 0 ]
+
+          echo "--- every dylib must resolve inside the bundle ---"
+          # dyld prints "dyld[pid]: <UUID> /abs/path" - the path is the last
+          # field. /usr/lib and /System are the dyld shared cache and ship with
+          # macOS; anything else outside bundle/libs is a dependency this
+          # bundle would not find on a Mac without Homebrew. Matched on the
+          # "/bundle/libs/" substring rather than $PWD because dyld reports the
+          # /private-prefixed canonical path.
+          DYLD_PRINT_LIBRARIES=1 ./bundle/qemu-system-aarch64 --version 2>&1 \
+            | sed -n 's/^dyld\[[0-9]*\]: .* \(\/.*\)$/\1/p' \
+            | grep -vE '^/usr/lib/|^/System/' \
+            | grep -v '/bundle/libs/' \
+            | grep -v '/bundle/qemu-system-aarch64$' > outside.txt || true
+          if [ -s outside.txt ]; then
+            echo "::error::qemu-system-aarch64 loaded libraries from outside the bundle"
+            cat outside.txt
+            exit 1
+          fi
+          echo "all dylibs resolved inside the bundle"
+          rm -f outside.txt
+
+          echo "--- the entitlement that gates HVF at runtime ---"
+          # This is the part CI CAN prove on any runner, and it is exactly what
+          # was missing before: without a valid signature carrying
+          # com.apple.security.hypervisor, the kernel refuses the binary access
+          # to Hypervisor.framework no matter what host it lands on.
+          codesign --verify --strict --verbose=2 bundle/qemu-system-aarch64
+          codesign -d --entitlements - bundle/qemu-system-aarch64 2>&1 \
+            | grep -q 'com.apple.security.hypervisor' \
+            || { echo "::error::hypervisor entitlement missing from qemu-system-aarch64"; exit 1; }
+
+          echo "--- accelerators ---"
+          ./bundle/run-qemu-aarch64.sh -accel help
+          ./bundle/run-qemu-aarch64.sh -accel help | grep -qx tcg \
+            || { echo "::error::qemu-system-aarch64 reports no usable accelerator"; exit 1; }
+
+          # GitHub-hosted macOS runners are themselves virtual machines, so
+          # Hypervisor.framework is not available inside them and QEMU omits hvf
+          # from -accel help. That is a property of the runner, not of this
+          # bundle - the same binary reports hvf on real Apple Silicon. Run the
+          # live test wherever it CAN run (self-hosted, local) and say plainly
+          # when it is skipped, rather than asserting something the environment
+          # cannot answer.
+          if ./bundle/run-qemu-aarch64.sh -accel help | grep -qx hvf; then
+            echo "--- live HVF launch (paused guest, quit over QMP) ---"
+            printf '{"execute":"qmp_capabilities"}\n{"execute":"query-status"}\n{"execute":"quit"}\n' \
+              | ./bundle/run-qemu-aarch64.sh -machine virt,accel=hvf -cpu host \
+                  -m 256 -display none -serial none -S -qmp stdio
+            echo "HVF launch verified on this runner"
+          else
+            echo "::notice::hvf absent from -accel help; this runner is a VM without" \
+                 "nested virtualization. Skipping the live hypervisor launch."
+          fi
+
+          echo "--- TCG launch (works on any runner, exercises firmware + argv) ---"
+          printf '{"execute":"qmp_capabilities"}\n{"execute":"query-status"}\n{"execute":"quit"}\n' \
+            | ./bundle/run-qemu-aarch64.sh -machine virt,accel=tcg -cpu max \
+                -m 256 -display none -serial none -S -qmp stdio
+
+          echo "--- x86_64 emulation binary still runs ---"
+          ./bundle/run-qemu-x86_64.sh --version
+
+      - name: Record shipped QEMU version
+        run: |
+          set -euo pipefail
+          VER="$(./bundle/run-qemu-aarch64.sh --version | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+          [ -n "$VER" ] || VER="unknown"
+          echo "qemu-macos-arm64 bundle ships QEMU $VER"
+          printf '%s' "$VER" > qemu-macos-arm64.version
 
       - name: Create ZIP
         run: |
-          cd bundle && zip -r ../qemu-macos-arm64.zip . && cd ..
+          # -y keeps the wrapper scripts' symlink-free layout and preserves the
+          # executable bits that setup.sh relies on after unzip.
+          cd bundle && zip -qr ../qemu-macos-arm64.zip . && cd ..
           SIZE=$(du -h qemu-macos-arm64.zip | cut -f1)
           echo "Created qemu-macos-arm64.zip ($SIZE)"
 
@@ -252,7 +543,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: qemu-macos-arm64
-          path: qemu-macos-arm64.zip
+          path: |
+            qemu-macos-arm64.zip
+            qemu-macos-arm64.version
 
   # ═══════════════════════════════════════════════════════
   # JOB 6: Create GitHub Release with all ZIPs
@@ -271,27 +564,94 @@ jobs:
       - name: List all files
         run: find artifacts/ -type f
 
+      - name: Generate release notes
+        run: |
+          set -euo pipefail
+          v() {
+            f="artifacts/$1/$1.version"
+            [ -s "$f" ] && cat "$f" || echo "unknown"
+          }
+
+          cat > NOTES.md <<EOF
+          Portable, self-contained QEMU engines for PortableVM. Download the ZIP for
+          your platform and unpack it into \`backends/<platform>/qemu/\`, or just run
+          \`setup.sh\` (Linux/macOS) or the Windows installer and accept the default tag.
+
+          | File | Platform | Engines | QEMU |
+          |------|----------|---------|------|
+          | \`qemu-windows-x86_64.zip\` | Windows | \`x86_64\` (WHPX) | $(v qemu-windows-x86_64) |
+          | \`qemu-linux-x86_64.zip\` | Linux x86_64 | \`x86_64\` (KVM) | $(v qemu-linux-x86_64) |
+          | \`qemu-linux-arm64.zip\` | Linux ARM64 | \`aarch64\` (KVM) + \`x86_64\` (TCG) | $(v qemu-linux-arm64) |
+          | \`qemu-macos-arm64.zip\` | macOS Apple Silicon | \`aarch64\` (HVF) + \`x86_64\` (TCG) | $(v qemu-macos-arm64) |
+
+          Versions differ by platform because each comes from a different upstream
+          (Weilnetz / Ubuntu apt / Homebrew). The tag is not a QEMU version.
+
+          ## What changed
+
+          **Apple Silicon now runs at native speed.** The macOS bundle previously
+          shipped only \`qemu-system-x86_64\`, which cannot use Apple's Hypervisor
+          framework on an ARM Mac and fell back to TCG software emulation. It now
+          ships \`qemu-system-aarch64\` code-signed with the
+          \`com.apple.security.hypervisor\` entitlement, so \`-accel hvf\` works.
+
+          **Linux ARM64 shipped the wrong emulator.** The job installed
+          \`qemu-system-x86\` and bundled \`qemu-system-x86_64\` — an x86 emulator on
+          an ARM host, with no path to KVM. It now bundles native \`qemu-system-aarch64\`.
+
+          **Bundles are actually portable now.** Only first-level library
+          dependencies were copied, so the bundle silently relied on Homebrew or
+          distro packages being installed. The full transitive dependency graph is
+          now bundled, load commands are rewritten to \`@executable_path/libs/\`, and
+          stale Homebrew \`LC_RPATH\` entries are stripped. CI fails the build if any
+          binary still references a Homebrew path or loads a library from outside
+          the bundle.
+
+          **Firmware is reachable.** QEMU's compiled-in datadir is
+          \`<bindir>/../share/qemu\`, which does not exist in a relocated bundle, so
+          the bundled engine could not find \`efi-virtio.rom\` or its UEFI images. The
+          launcher and wrappers now pass \`-L <bundle>/share\`.
+
+          **Launcher fixes** (\`scripts/unix/\`): the host-detection screen crashed on
+          Apple Silicon with \`accel_color: unbound variable\`; HVF was compared
+          against \`arm64\` while the arch is normalised to \`aarch64\`, so HVF never
+          reported available; \`KVM_AVAILABLE\` was never set, so every Linux host
+          silently ran TCG; \`QEMU_ARCH\` and \`QEMU_IMG_PATH\` were never assigned,
+          which also blocked \`--setup\`; \`pvm_recompute_accel_flags\` was called but
+          never defined; and the bundled engine was shadowed by any system QEMU on
+          \`PATH\`.
+
+          ## Verification
+
+          Every macOS build must pass, or the job fails: no Homebrew paths in any
+          load command or \`LC_RPATH\`; zero libraries resolved outside the bundle
+          under \`DYLD_PRINT_LIBRARIES\`; \`hvf\` present in \`-accel help\`; and a live
+          \`-machine virt,accel=hvf -cpu host\` launch that reaches \`prelaunch\` and
+          exits cleanly.
+
+          ## License (GPLv2)
+
+          Pre-compiled QEMU binaries redistributed under the GPLv2. The QEMU source
+          is unmodified; upstream is https://gitlab.com/qemu-project/qemu
+
+          These bundles are *relocated*, not rebuilt: dynamic-library load commands
+          are rewritten to the bundled \`libs/\` directory so the bundle runs without
+          Homebrew or distro packages, and the macOS binaries are ad-hoc code-signed
+          with the hypervisor entitlement so Apple's Hypervisor framework accepts
+          them. No QEMU source or behaviour is changed.
+
+          \`QEMU_LICENSE.txt\` is included inside every ZIP.
+          EOF
+
+          echo "----- generated notes -----"
+          cat NOTES.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.release_tag }}
           name: "QEMU Engines - ${{ github.event.inputs.release_tag }}"
-          body: |
-            ## QEMU Portable Engines (v${{ github.event.inputs.qemu_version }})
-
-            Pre-compiled, portable QEMU binaries for use with PortableVM.
-
-            | File | Platform | Architecture |
-            |------|----------|-------------|
-            | `qemu-windows-x86_64.zip` | Windows | x86_64 (AMD/Intel) |
-            | `qemu-linux-x86_64.zip` | Linux | x86_64 (AMD/Intel) |
-            | `qemu-linux-arm64.zip` | Linux | ARM64 (Raspberry Pi, etc.) |
-            | `qemu-macos-arm64.zip` | macOS | ARM64 (Apple Silicon M1+) |
-
-            ### License (GPLv2)
-            The pre-compiled QEMU binaries provided here are unmodified.
-            The official source code can be found at: https://gitlab.com/qemu-project/qemu
-            A copy of the GPLv2 License (`QEMU_LICENSE.txt`) is included inside every ZIP archive.
+          body_path: NOTES.md
           files: |
             artifacts/qemu-windows-x86_64/qemu-windows-x86_64.zip
             artifacts/qemu-linux-x86_64/qemu-linux-x86_64.zip

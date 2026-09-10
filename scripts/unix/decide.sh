@@ -151,6 +151,10 @@ run_decision_engine() {
         if alt="$(pvm_find_qemu "$root_dir" "$DECISION_ARCH")"; then
             QEMU_PATH="$alt"
             QEMU_ARCH="$DECISION_ARCH"
+            # TARGET_ARCH is what build_command.sh and display.sh read; leaving
+            # it on detect.sh's config-derived value would build the argv for a
+            # different guest than the one being launched.
+            TARGET_ARCH="$DECISION_ARCH"
             pvm_probe_qemu "$QEMU_PATH"
             pvm_recompute_accel_flags
         else
@@ -234,7 +238,7 @@ run_decision_engine() {
         if [ "$HVF_AVAILABLE" -eq 1 ]; then
             DECISION_ACCEL="hvf"
         else
-            if [[ "$HOST_ARCH" == "arm64" && "$TARGET_ARCH" == "x86_64" ]]; then
+            if [ "$HOST_ARCH" = "aarch64" ] && [ "$DECISION_ARCH" = "x86_64" ]; then
                 DECISION_ACCEL_WARN="Cross-architecture virtualization (x86_64 guest on Apple Silicon host) does not support HVF. Running with TCG software emulation."
             else
                 DECISION_ACCEL_WARN="HVF unavailable. Running with TCG software emulation."

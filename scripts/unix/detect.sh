@@ -149,6 +149,39 @@ pvm_has() {
     esac
 }
 
+# pvm_recompute_accel_flags
+# Re-derives KVM_AVAILABLE / HVF_AVAILABLE from the three facts that have to
+# hold together: the host exposes the hypervisor (HOST_KVM_OK / Darwin), the
+# QEMU binary currently selected was built with it (QEMU_ACCELS), and the guest
+# ISA matches the host ISA. decide.sh calls this after switching QEMU_PATH for
+# a per-VM arch override, because "hvf" on qemu-system-aarch64 says nothing
+# about qemu-system-x86_64 on the same Apple Silicon Mac.
+pvm_recompute_accel_flags() {
+    local guest="${QEMU_ARCH:-$TARGET_ARCH}"
+
+    KVM_AVAILABLE=0
+    HVF_AVAILABLE=0
+    HOST_HVF_OK=0
+
+    [ "$guest" = "$HOST_ARCH" ] || return 0
+
+    case "$HOST_OS" in
+        Linux)
+            if [ "$HOST_KVM_OK" -eq 1 ] && pvm_has "$QEMU_ACCELS" "kvm"; then
+                KVM_AVAILABLE=1
+            fi
+            ;;
+        Darwin)
+            # Every Mac since 10.10 ships Hypervisor.framework; the binary
+            # having been built with it is the part that actually varies.
+            HOST_HVF_OK=1
+            if pvm_has "$QEMU_ACCELS" "hvf"; then
+                HVF_AVAILABLE=1
+            fi
+            ;;
+    esac
+}
+
 detect_host_info() {
     local root_dir="$1"
     local guest_arch="${2:-}"
@@ -225,64 +258,62 @@ detect_host_info() {
     fi
 
     # 2. Resolve Target Architecture & Locate QEMU Binary
+    # An explicit guest_arch argument wins over config.json: callers that
+    # already know which VM they are about to launch pass it so the probe runs
+    # against the binary that will actually be executed.
     TARGET_ARCH="x86_64"
-    if [ -f "$root_dir/config.json" ]; then
+    if [ -n "$guest_arch" ]; then
+        TARGET_ARCH="$(pvm_norm_arch "$guest_arch")"
+    elif [ -f "$root_dir/config.json" ]; then
         local cfg_arch
         cfg_arch=$(grep -o '"arch"[^:]*:[^"]*"[^"]*"' "$root_dir/config.json" 2>/dev/null | head -n1 | cut -d'"' -f4)
         if [ -n "$cfg_arch" ]; then
-            TARGET_ARCH="$cfg_arch"
+            TARGET_ARCH="$(pvm_norm_arch "$cfg_arch")"
         fi
     fi
 
     # If host is Apple Silicon / ARM64 and target is x86_64, check if native aarch64 binary exists
-    if [[ ("$HOST_ARCH" == "arm64" || "$HOST_ARCH" == "aarch64") && "$TARGET_ARCH" == "x86_64" ]]; then
-        if ! command -v qemu-system-x86_64 >/dev/null 2>&1 && command -v qemu-system-aarch64 >/dev/null 2>&1; then
+    if [ "$HOST_ARCH" = "aarch64" ] && [ "$TARGET_ARCH" = "x86_64" ]; then
+        if ! pvm_find_qemu "$root_dir" x86_64 >/dev/null 2>&1 \
+           && pvm_find_qemu "$root_dir" aarch64 >/dev/null 2>&1; then
             TARGET_ARCH="aarch64"
         fi
     fi
 
-    local qemu_bin="qemu-system-$TARGET_ARCH"
-    local qemu_search_paths=(
-        "$root_dir/backends/linux/qemu/$qemu_bin"
-        "/opt/homebrew/bin/$qemu_bin"
-        "/usr/local/bin/$qemu_bin"
-        "/usr/bin/$qemu_bin"
-    )
-
-    if command -v "$qemu_bin" >/dev/null 2>&1; then
-        QEMU_PATH=$(command -v "$qemu_bin")
+    # pvm_find_qemu searches the bundled backend for THIS platform first, which
+    # is the whole point of a portable install: a Homebrew QEMU on the developer
+    # machine must not shadow the binary that ships on the SSD.
+    if QEMU_PATH="$(pvm_find_qemu "$root_dir" "$TARGET_ARCH")"; then
+        QEMU_ARCH="$TARGET_ARCH"
     else
-        for p in "${qemu_search_paths[@]}"; do
-            if [ -x "$p" ]; then
-                QEMU_PATH="$p"
+        QEMU_PATH=""
+        # Fall back to the host's own architecture before giving up entirely -
+        # an x86_64-only config on an Apple Silicon Mac still gets a working
+        # (emulating) launcher rather than "QEMU NOT FOUND".
+        local alt_arch
+        for alt_arch in "$HOST_ARCH" x86_64; do
+            [ "$alt_arch" = "$TARGET_ARCH" ] && continue
+            if QEMU_PATH="$(pvm_find_qemu "$root_dir" "$alt_arch")"; then
+                TARGET_ARCH="$alt_arch"
+                QEMU_ARCH="$alt_arch"
                 break
             fi
+            QEMU_PATH=""
         done
-    fi
-
-    # Fallback to general qemu-system-x86_64 if TARGET_ARCH was not found
-    if [ -z "$QEMU_PATH" ] && [ "$TARGET_ARCH" != "x86_64" ]; then
-        if command -v qemu-system-x86_64 >/dev/null 2>&1; then
-            QEMU_PATH=$(command -v qemu-system-x86_64)
-            TARGET_ARCH="x86_64"
-        fi
     fi
 
     if [ -n "$QEMU_PATH" ]; then
         pvm_probe_qemu "$QEMU_PATH"
     fi
 
-    # 3. Virtualization & Hypervisor support check on Darwin
-    if [ "$HOST_OS" = "Darwin" ]; then
-        # Apple HVF only accelerates guests with matching CPU ISA (arm64 guest on arm64 host, x86_64 on x86_64)
-        if [[ "$HOST_ARCH" == "arm64" && "$TARGET_ARCH" == "aarch64" ]]; then
-            HVF_AVAILABLE=1
-        elif [[ "$HOST_ARCH" == "x86_64" && "$TARGET_ARCH" == "x86_64" ]]; then
-            HVF_AVAILABLE=1
-        else
-            HVF_AVAILABLE=0
-        fi
-    fi
+    QEMU_IMG_PATH="$(pvm_find_qemu_img "$root_dir" || true)"
+
+    # 3. Hypervisor availability
+    # Both KVM and HVF only accelerate a guest whose ISA matches the host's, so
+    # this is one shared rule rather than a per-OS special case. Note HOST_ARCH
+    # is normalised ("arm64" -> "aarch64"), which is why the comparison is
+    # against TARGET_ARCH in QEMU's own spelling.
+    pvm_recompute_accel_flags
 
     # 4. Storage / SSD Free Space (in GB)
     HOST_SSD_FREE_GB=0
