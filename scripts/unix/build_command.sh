@@ -134,6 +134,12 @@ build_qemu_command() {
 
     # ---- Misc -----------------------------------------------------------
     QEMU_ARGS+=("-rtc" "base=utc,clock=host")
+    
+    # Hardware RNG: Prevents installers from hanging while waiting for entropy.
+    if pvm_device_exists virtio-rng-pci; then
+        QEMU_ARGS+=("-device" "virtio-rng-pci")
+    fi
+
     # Lets the host reclaim guest memory that the guest is not using. Optional
     # in every sense, so it is skipped rather than fatal when absent.
     if pvm_device_exists virtio-balloon-pci; then

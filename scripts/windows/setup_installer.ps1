@@ -204,6 +204,16 @@ $lblTitle.AutoSize = $true
 $lblTitle.Location = New-Object System.Drawing.Point(20, 12)
 $titlePanel.Controls.Add($lblTitle)
 
+$pbLogo = New-Object System.Windows.Forms.PictureBox
+$pbLogo.Size = New-Object System.Drawing.Size(42, 42)
+$pbLogo.Location = New-Object System.Drawing.Point(595, 12)
+$pbLogo.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
+$logoPng = Join-Path $SourceRoot "logo\portable_vm_logo.png"
+if (Test-Path $logoPng) {
+    try { $pbLogo.Image = [System.Drawing.Image]::FromFile($logoPng) } catch {}
+}
+$titlePanel.Controls.Add($pbLogo)
+
 $lblSubTitle = New-Object System.Windows.Forms.Label
 $lblSubTitle.Text = "Step 1 of 7"
 $lblSubTitle.Font = $fntBody
@@ -777,7 +787,7 @@ function Show-Step5 {
     $contentPanel.Controls.Add($lblTag)
 
     $txtTag = New-Object System.Windows.Forms.TextBox
-    $txtTag.Text = "qemu-v9.2.0"
+    $txtTag.Text = "qemu-engines-v1.0.0"
     $txtTag.Location = New-Object System.Drawing.Point(150, 132)
     $txtTag.Size = New-Object System.Drawing.Size(150, 20)
     $contentPanel.Controls.Add($txtTag)
@@ -846,7 +856,7 @@ function Show-Step5 {
 
         if ($engines.Count -eq 0) {
             $lblQemuStatus.Text = "[!] Please select at least one engine."
-            $lblQemuStatus.ForeColor = $colRed
+            $lblQemuStatus.ForeColor = [System.Drawing.Color]::Crimson
             $btnDownload.Enabled = $true
             $btnBack.Enabled = $true
             return
@@ -858,7 +868,7 @@ function Show-Step5 {
         try {
             foreach ($engine in $engines) {
                 $lblQemuStatus.Text = "Downloading $($engine.Name) engine..."
-                $lblQemuStatus.ForeColor = $colDarkText
+                $lblQemuStatus.ForeColor = [System.Drawing.Color]::FromArgb(30, 41, 59)
                 [System.Windows.Forms.Application]::DoEvents()
                 
                 $url = "$repoUrl/$($engine.Zip)"
@@ -902,12 +912,11 @@ function Show-Step5 {
             $btnNext.Enabled = $true
             $btnBack.Enabled = $true
             $lblQemuStatus.Text = "[OK] All selected engines successfully installed!"
-            $lblQemuStatus.ForeColor = $colGreen
-            $btnDownload.Text = "Installed"
-            
+            $lblQemuStatus.ForeColor = [System.Drawing.Color]::FromArgb(16, 185, 129)
+            [System.Windows.Forms.Application]::DoEvents()
         } catch {
             $lblQemuStatus.Text = "[!] Error: $($_.Exception.Message)`nEnsure you have uploaded the .zip files to your GitHub Releases!"
-            $lblQemuStatus.ForeColor = $colRed
+            $lblQemuStatus.ForeColor = [System.Drawing.Color]::Crimson
             $btnDownload.Enabled = $true
             $btnBack.Enabled = $true
         }

@@ -15,7 +15,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_OWNER="aether70"
 REPO_NAME="pvm"
-DEFAULT_TAG="qemu-v9.2.0"
+DEFAULT_TAG="qemu-engines-v1.0.0"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'

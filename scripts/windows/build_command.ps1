@@ -211,6 +211,13 @@ function Build-QemuCommand {
     $argsList.Add("-rtc")
     $argsList.Add("base=utc,clock=host")
 
+    # Hardware RNG: Prevents installers (e.g., Debian/Kali simple-cdd) from
+    # hanging indefinitely while waiting for entropy to generate crypto keys.
+    if (Test-QemuDevice -HostInfo $Decision.HostInfo -DeviceName "virtio-rng-pci") {
+        $argsList.Add("-device")
+        $argsList.Add("virtio-rng-pci")
+    }
+
     # Lets the host reclaim guest memory the guest is not using. Optional in
     # every sense, so it is skipped rather than fatal when absent.
     if (Test-QemuDevice -HostInfo $Decision.HostInfo -DeviceName "virtio-balloon-pci") {
